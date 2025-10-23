@@ -1316,26 +1316,28 @@ pub(crate) fn parse_posting(input: &str) -> ParseResult<'_, Posting> {
     map(
         tuple((
             account_name,
-            // amount
-            opt(preceded(pair(alt((tag("  "), tag("\t"))), space0), simple_amount_field)),
-            // lot price
-            opt(delimited(
-                space0,
-                alt((
-                    map(delimited(char('{'), simple_amount_field, char('}')), |a| (false, a)),
-                    map(delimited(tag("{{"), simple_amount_field, tag("}}")), |a| (true, a)),
+            opt(tuple((
+                // amount
+                preceded(pair(alt((tag("  "), tag("\t"))), space0), simple_amount_field),
+                // lot price
+                opt(delimited(
+                    space0,
+                    alt((
+                        map(delimited(char('{'), simple_amount_field, char('}')), |a| (false, a)),
+                        map(delimited(tag("{{"), simple_amount_field, tag("}}")), |a| (true, a)),
+                    )),
+                    space0,
                 )),
-                space0,
-            )),
-            // cost
-            opt(pair(
-                delimited(space0, map(many_m_n(1, 2, char('@')), |r| r.len() == 2), space0),
-                simple_amount_field,
-            )),
+                // cost
+                opt(pair(
+                    delimited(space0, map(many_m_n(1, 2, char('@')), |r| r.len() == 2), space0),
+                    simple_amount_field,
+                )),
+            ))),
             opt(preceded(space0, simple_comment_field)),
             opt(line_ending),
         )),
-        |(account, mut amount, lot_price, cost, comment, _)| {
+        |(account, amount_price_cost, comment, _)| {
             // Create a dummy account reference for now
             // TODO: Proper account management
             use compact_str::CompactString;
@@ -1344,10 +1346,10 @@ pub(crate) fn parse_posting(input: &str) -> ParseResult<'_, Posting> {
             ));
             let mut posting = Posting::new(account_ref);
 
-            if let Some(ref mut amount) = amount {
+            if let Some((mut amount, lot_price, cost)) = amount_price_cost {
                 if let Some((calculate_price, mut price)) = lot_price {
                     if calculate_price {
-                        price.div_amount(amount).expect("dividing total price by qty");
+                        price.div_amount(&amount).expect("dividing total price by qty");
                     }
 
                     if amount.has_commodity() {
@@ -1363,19 +1365,19 @@ pub(crate) fn parse_posting(input: &str) -> ParseResult<'_, Posting> {
                         amount.set_commodity(Arc::new(commodity));
                     }
                 }
-            }
 
-            posting.amount = amount;
+                posting.amount = Some(amount);
 
-            if let Some((calculate_cost, mut cost)) = cost {
-                if calculate_cost {
-                    cost.div_amount(posting.amount.as_ref().unwrap())
-                        .expect("dividing total cost by qty");
-                    posting.cost = Some(cost);
-                    posting.given_cost = None;
-                } else {
-                    posting.cost = Some(cost.clone());
-                    posting.given_cost = Some(cost);
+                if let Some((calculate_cost, mut cost)) = cost {
+                    if calculate_cost {
+                        cost.div_amount(posting.amount.as_ref().unwrap())
+                            .expect("dividing total cost by qty");
+                        posting.cost = Some(cost);
+                        posting.given_cost = None;
+                    } else {
+                        posting.cost = Some(cost.clone());
+                        posting.given_cost = Some(cost);
+                    }
                 }
             }
 
