@@ -161,7 +161,9 @@ impl LedgerHarness {
 
             // Check for early termination on failure
             if !self.config.continue_on_failure {
-                let has_failures = all_results.iter().any(|r| r.status == TestStatus::Failed);
+                let has_failures = all_results.iter().any(|r| {
+                    r.status == TestStatus::FailedOutput || r.status == TestStatus::FailedExitCode
+                });
                 if has_failures {
                     break;
                 }
