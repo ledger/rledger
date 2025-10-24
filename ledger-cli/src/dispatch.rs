@@ -14,7 +14,7 @@ use ledger_core::posting::Posting;
 use ledger_math::Commodity;
 use regex::Regex;
 use std::collections::HashSet;
-use std::io::{self, BufWriter, Write};
+use std::io::{self, Write};
 use std::sync::Arc;
 
 /// Main command dispatcher
@@ -121,7 +121,7 @@ impl Dispatcher {
         match command {
             Command::Balance(args) => commands::balance::balance(&self.session, args),
             Command::Register(args) => commands::register::register(&self.session, args),
-            Command::Print(args) => self.execute_print_command(args),
+            Command::Print(args) => commands::print::print(&self.session, args),
             Command::Accounts(args) => self.execute_accounts_command(args),
             Command::Commodities(args) => self.execute_commodities_command(args),
             Command::Payees(args) => self.execute_payees_command(args),
@@ -272,29 +272,6 @@ impl Dispatcher {
 // Command implementations - these will be expanded with actual functionality
 
 impl Dispatcher {
-    fn execute_print_command(&mut self, args: &crate::cli::PrintArgs) -> Result<i32> {
-        // Get the parsed journal
-        let journal = match &self.session.parsed_journal {
-            Some(journal) => journal,
-            None => {
-                return Err(anyhow::anyhow!("No journal loaded"));
-            }
-        };
-
-        let mut writer = BufWriter::new(io::stdout());
-        journal.write_transactions(&mut writer)?;
-
-        if !args.pattern.is_empty() && self.session.verbose_enabled {
-            eprintln!("Account patterns: {:?}", args.pattern);
-        }
-
-        if args.raw && self.session.verbose_enabled {
-            eprintln!("Raw format option not yet implemented");
-        }
-
-        Ok(0)
-    }
-
     fn execute_accounts_command(&mut self, args: &crate::cli::AccountsArgs) -> Result<i32> {
         let journal = match &self.session.parsed_journal {
             Some(journal) => journal,

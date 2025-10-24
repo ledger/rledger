@@ -3,6 +3,7 @@
 use crate::posting::{Posting, PostingFlags};
 use chrono::NaiveDate;
 use ledger_math::amount::Amount;
+use ledger_math::Commodity;
 use rust_decimal::Decimal;
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -430,6 +431,37 @@ impl Transaction {
     /// Check if any posting has extended data
     pub fn has_xdata(&self) -> bool {
         self.postings.iter().any(|p| p.has_xdata())
+    }
+
+    /// Format transaction and write it to the given writer.
+    pub fn write(
+        &self,
+        writer: &mut impl std::io::Write,
+        journal_commodities: &HashMap<String, Arc<Commodity>>,
+    ) -> Result<(), std::io::Error> {
+        let status = match self.status {
+            TransactionStatus::Uncleared => "",
+            TransactionStatus::Cleared => " *",
+            TransactionStatus::Pending => " !",
+        };
+
+        writeln!(writer, "{}{status} {}", self.date.format("%Y/%m/%d"), &self.payee)?;
+
+        let postings = &self.postings;
+        // TODO: use --account-width?
+        let longest_account_name = self
+            .postings
+            .iter()
+            .map(|p| p.account.borrow_mut().fullname().len())
+            .max()
+            .unwrap_or(0);
+
+        for posting in postings {
+            posting.write(writer, longest_account_name, &journal_commodities)?;
+            writeln!(writer)?;
+        }
+
+        Ok(())
     }
 }
 

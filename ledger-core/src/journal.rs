@@ -1,7 +1,7 @@
 //! Journal data structure for storing transactions
 
 use crate::account::{Account, AccountRef};
-use crate::transaction::{Transaction, TransactionStatus};
+use crate::transaction::Transaction;
 use ledger_math::commodity::Commodity;
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -92,43 +92,9 @@ impl Journal {
     pub fn write_transactions(
         &self,
         writer: &mut impl std::io::Write,
-    ) -> Result<(), std::io::Error> {
-        let transactions = &self.transactions;
-
-        for (i, transaction) in transactions.iter().enumerate() {
-            if i != 0 {
-                writeln!(writer)?; // Empty line between transactions
-            }
-
-            let status = match transaction.status {
-                TransactionStatus::Uncleared => "",
-                TransactionStatus::Cleared => " *",
-                TransactionStatus::Pending => " !",
-            };
-
-            writeln!(
-                writer,
-                "{}{status} {}",
-                transaction.date.format("%Y/%m/%d"),
-                &transaction.payee
-            )?;
-
-            let postings = &transaction.postings;
-            // TODO: use --account-width?
-            let longest_account_name = transaction
-                .postings
-                .iter()
-                .map(|p| p.account.borrow_mut().fullname().len())
-                .max()
-                .unwrap_or(0);
-
-            for posting in postings {
-                posting.write(writer, longest_account_name, &self.commodities)?;
-                writeln!(writer)?;
-            }
-        }
-
-        Ok(())
+    ) -> Result<(), crate::report::ReportError> {
+        use crate::report::{PrintReport, ReportGenerator};
+        PrintReport::new(self.clone()).generate(writer, &Default::default())
     }
 
     /// Format all transactions and return them as a String

@@ -1014,54 +1014,22 @@ impl PrintReport {
 
 impl ReportGenerator for PrintReport {
     fn generate<W: Write>(&mut self, writer: &mut W, _options: &ReportOptions) -> ReportResult<()> {
+        let mut first = true;
         for transaction in &self.journal.transactions {
             if !self.transaction_filters.matches(transaction) {
                 continue;
             }
 
-            // Write transaction date
-            writeln!(writer, "{}", transaction.date.format("%Y-%m-%d"))
+            if first {
+                first = false;
+            } else {
+                // Empty line between transactions
+                writeln!(writer).map_err(|e| ReportError::IoError(e.to_string()))?;
+            }
+
+            transaction
+                .write(writer, &self.journal.commodities)
                 .map_err(|e| ReportError::IoError(e.to_string()))?;
-
-            // Write transaction code if present
-            if let Some(ref code) = transaction.code {
-                writeln!(writer, "    ; Code: {}", code)
-                    .map_err(|e| ReportError::IoError(e.to_string()))?;
-            }
-
-            // Write payee
-            writeln!(writer, "    * {}", transaction.payee)
-                .map_err(|e| ReportError::IoError(e.to_string()))?;
-
-            // Write note if present
-            if let Some(ref note) = transaction.note {
-                writeln!(writer, "    ; {}", note)
-                    .map_err(|e| ReportError::IoError(e.to_string()))?;
-            }
-
-            // Write postings
-            for posting in &transaction.postings {
-                {
-                    let account_name = posting.account.borrow().fullname_immutable();
-
-                    if let Some(ref amount) = posting.amount {
-                        writeln!(writer, "    {}    {}", account_name, amount)
-                            .map_err(|e| ReportError::IoError(e.to_string()))?;
-                    } else {
-                        writeln!(writer, "    {}", account_name)
-                            .map_err(|e| ReportError::IoError(e.to_string()))?;
-                    }
-
-                    // Write posting note if present
-                    if let Some(ref note) = posting.note {
-                        writeln!(writer, "        ; {}", note)
-                            .map_err(|e| ReportError::IoError(e.to_string()))?;
-                    }
-                }
-            }
-
-            // Empty line between transactions
-            writeln!(writer).map_err(|e| ReportError::IoError(e.to_string()))?;
         }
 
         Ok(())
