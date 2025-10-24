@@ -3,13 +3,14 @@
 //! This module provides the core reporting infrastructure for generating
 //! balance reports, register reports, and other financial summaries.
 
-use crate::account::AccountRef;
+use crate::account::{AccountRef, AccountTree};
 use crate::cache::{CacheKey, CacheManager};
 use crate::filters::{FilterChain, PostingFilter, TransactionFilter};
 use crate::journal::Journal;
 use crate::posting::Posting;
 use crate::transaction::Transaction;
 use ledger_math::balance::Balance;
+use ledger_math::{FormatConfig, FormatFlags};
 use std::collections::{BTreeMap, HashMap};
 use std::fmt;
 use std::io::Write;
@@ -56,6 +57,8 @@ pub struct ReportOptions {
     pub sort_by: SortCriteria,
     /// Collapse accounts with only one posting
     pub collapse: bool,
+    /// Show a final total
+    pub final_total: bool,
     /// Show running totals
     pub running_total: bool,
     /// Column width for account names
@@ -76,6 +79,7 @@ impl Default for ReportOptions {
             empty: false,
             sort_by: SortCriteria::Name,
             collapse: false,
+            final_total: true,
             running_total: false,
             account_width: None,
             amount_width: None,
@@ -110,11 +114,17 @@ pub trait ReportGenerator {
     fn report_type(&self) -> &str;
 }
 
+#[derive(Debug, Clone)]
+pub enum BalanceReportAccount {
+    Account(AccountRef),
+    String(String),
+}
+
 /// Account balance information for reporting
 #[derive(Debug, Clone)]
 pub struct AccountBalance {
     /// Reference to the account
-    pub account: AccountRef,
+    pub account: BalanceReportAccount,
     /// Current balance
     pub balance: Balance,
     /// Number of postings that contributed to this balance
@@ -188,6 +198,7 @@ impl BalanceReport {
         // Cache miss or no cache - compute fresh
         let mut account_balances: HashMap<String, Balance> = HashMap::new();
         let mut account_counts: HashMap<String, usize> = HashMap::new();
+        let mut account_tree = AccountTree::new();
 
         // Process all transactions
         for transaction in &self.journal.transactions {
@@ -205,6 +216,7 @@ impl BalanceReport {
 
                 // Get account name
                 let account_name = posting.account.borrow().fullname_immutable();
+                account_tree.find_account(&account_name, true);
 
                 // Get posting amount
                 if let Some(ref amount) = posting.amount {
@@ -219,24 +231,21 @@ impl BalanceReport {
 
                     // Also update parent accounts if not flat display
                     if !options.flat {
-                        let mut parent_path = String::new();
-                        for segment in account_name.split(':') {
-                            if !parent_path.is_empty() {
-                                parent_path.push(':');
-                            }
-                            parent_path.push_str(segment);
+                        let mut parent_path = account_name;
+                        while let Some((path, _)) = parent_path.rsplit_once(":") {
+                            account_tree.find_account(&path, true);
 
-                            if parent_path != account_name {
-                                let parent_balance =
-                                    account_balances.entry(parent_path.clone()).or_default();
-                                parent_balance.add_amount(amount).map_err(|e| {
-                                    ReportError::InvalidConfig(format!(
-                                        "Failed to add parent amount: {}",
-                                        e
-                                    ))
-                                })?;
-                                *account_counts.entry(parent_path.clone()).or_insert(0) += 1;
-                            }
+                            let parent_balance =
+                                account_balances.entry(path.to_string()).or_default();
+                            parent_balance.add_amount(amount).map_err(|e| {
+                                ReportError::InvalidConfig(format!(
+                                    "Failed to add parent amount: {}",
+                                    e
+                                ))
+                            })?;
+                            *account_counts.entry(path.to_string()).or_insert(0) += 1;
+
+                            parent_path = path.to_string();
                         }
                     }
                 }
@@ -246,37 +255,65 @@ impl BalanceReport {
         // Convert to AccountBalance structures
         let mut result = BTreeMap::new();
         for (account_name, balance) in &account_balances {
-            // Skip zero balances if not showing empty accounts
-            if !options.empty && balance.is_zero() {
-                continue;
-            }
-
-            // Apply depth filtering
+            let account = account_tree.find_account(account_name, false).unwrap();
+            let child_accounts: Vec<_> = account
+                .borrow()
+                .children
+                .values()
+                .map(|a| a.borrow().fullname_immutable())
+                .collect();
             let depth = account_name.matches(':').count();
-            if let Some(max_depth) = options.depth {
-                if depth >= max_depth {
+
+            let posting_count = *account_counts.get(account_name).unwrap_or(&0);
+            let child_count = child_accounts.len();
+            let (_has_children, has_own_postings) = match child_accounts.as_slice() {
+                [only_child] => {
+                    let child_postings = *account_counts.get(only_child.as_str()).unwrap_or(&0);
+                    (true, posting_count > child_postings)
+                }
+                [] => (false, false),
+                [..] => (true, true),
+            };
+
+            if child_count == 0 || !has_own_postings {
+                // Skip zero balances if not showing empty accounts
+                if !options.empty && balance.is_zero() {
+                    continue;
+                }
+
+                // Skip child accounts if showing collapsed (top level only)
+                if options.collapse && depth > 0 {
+                    continue;
+                }
+
+                // Apply depth filtering
+                if let Some(max_depth) = options.depth {
+                    if depth >= max_depth {
+                        continue;
+                    }
+                }
+
+                if child_count == 1 && !has_own_postings && !(options.collapse && depth == 0) {
                     continue;
                 }
             }
 
             // Try to get account reference
-            if let Ok(account_ref) = self.journal.find_account(account_name) {
-                let has_children = account_name.contains(':')
-                    || account_balances
-                        .keys()
-                        .any(|k| k.starts_with(&format!("{}:", account_name)));
+            let account = match self.journal.find_account(account_name) {
+                Ok(account_ref) => BalanceReportAccount::Account(account_ref),
+                Err(_) => BalanceReportAccount::String(account_name.clone()),
+            };
 
-                let account_balance = AccountBalance {
-                    account: account_ref,
-                    balance: balance.clone(),
-                    count: *account_counts.get(account_name).unwrap_or(&0),
-                    depth,
-                    has_children,
-                    total_balance: balance.clone(), // For now, same as balance - would need recursive calculation
-                };
+            let account_balance = AccountBalance {
+                account,
+                balance: balance.clone(),
+                count: posting_count,
+                depth,
+                has_children: child_count > 0,
+                total_balance: balance.clone(), // For now, same as balance - would need recursive calculation
+            };
 
-                result.insert(account_name.clone(), account_balance);
-            }
+            result.insert(account_name.clone(), account_balance);
         }
 
         // Cache the result if caching is enabled
@@ -306,22 +343,25 @@ impl BalanceReport {
         let mut result = BTreeMap::new();
 
         for (account_name, balance) in &cached_data {
-            if let Ok(account_ref) = self.journal.find_account(account_name) {
-                let depth = account_name.matches(':').count();
-                let has_children = account_name.contains(':')
-                    || cached_data.keys().any(|k| k.starts_with(&format!("{}:", account_name)));
+            let account = match self.journal.find_account(account_name) {
+                Ok(account_ref) => BalanceReportAccount::Account(account_ref),
+                Err(_) => BalanceReportAccount::String(account_name.clone()),
+            };
 
-                let account_balance = AccountBalance {
-                    account: account_ref,
-                    balance: balance.clone(),
-                    count: 0, // We don't cache count information
-                    depth,
-                    has_children,
-                    total_balance: balance.clone(),
-                };
+            let depth = account_name.matches(':').count();
+            let has_children = account_name.contains(':')
+                || cached_data.keys().any(|k| k.starts_with(&format!("{}:", account_name)));
 
-                result.insert(account_name.clone(), account_balance);
-            }
+            let account_balance = AccountBalance {
+                account,
+                balance: balance.clone(),
+                count: 0, // We don't cache count information
+                depth,
+                has_children,
+                total_balance: balance.clone(),
+            };
+
+            result.insert(account_name.clone(), account_balance);
         }
 
         Ok(result)
@@ -362,18 +402,23 @@ impl BalanceReport {
     fn format_account_name(
         &self,
         account_balance: &AccountBalance,
+        indent: usize,
+        skip: usize,
         options: &ReportOptions,
     ) -> String {
         let account = account_balance.account.clone();
-        let account_ref = account.borrow();
+        let account_name = match account {
+            BalanceReportAccount::Account(account_ref) => account_ref.borrow().fullname_immutable(),
+            BalanceReportAccount::String(account_name) => account_name,
+        };
+
         let name = if options.flat {
-            account_ref.fullname_immutable()
+            account_name
         } else {
-            // Show only the last segment with proper indentation
-            let full_name = account_ref.fullname_immutable();
-            let segments: Vec<&str> = full_name.split(':').collect();
-            let indent = "  ".repeat(account_balance.depth);
-            let last_segment = segments.last().copied().unwrap_or(&full_name);
+            let segments: Vec<&str> = account_name.split(':').skip(skip).collect();
+            let last_segment =
+                if segments.is_empty() { account_name.to_string() } else { segments.join(":") };
+            let indent = "  ".repeat(indent);
             format!("{}{}", indent, last_segment)
         };
 
@@ -390,7 +435,14 @@ impl BalanceReport {
             // Filter by specific currency
             balance.to_string() // FIXME: Would need currency filtering in Balance
         } else {
-            balance.to_string()
+            let config = FormatConfig::default()
+                .with_width(20, None)
+                .with_flags(FormatFlags::RIGHT_JUSTIFY)
+                .with_precision(0);
+
+            let mut buffer = String::new();
+            balance.print(&mut buffer, &config).expect("writing to string");
+            buffer
         };
 
         if let Some(width) = options.amount_width {
@@ -407,7 +459,7 @@ impl ReportGenerator for BalanceReport {
         let balances = self.collect_balances(options)?;
 
         // Sort according to criteria
-        let sorted_balances = self.sort_balances(balances, options.sort_by);
+        let sorted_balances = self.sort_balances(balances.clone(), options.sort_by);
 
         // Write header if needed
         if options.show_codes {
@@ -418,12 +470,38 @@ impl ReportGenerator for BalanceReport {
         }
 
         // Write each account balance
-        for (_account_name, account_balance) in sorted_balances {
-            let account_name = self.format_account_name(&account_balance, options);
+        let mut prev_account: Option<String> = None;
+        let mut last_depth = 0;
+        for (account_name, account_balance) in sorted_balances {
+            let (indent, skip) = if prev_account
+                .as_ref()
+                .is_none_or(|a| !account_name.starts_with(a))
+            {
+                (0, 0)
+            } else if account_balance.depth > last_depth + 1 {
+                // skipping/combining levels
+                (last_depth + 1, prev_account.as_ref().map(|a| a.split(':').count()).unwrap_or(0))
+            } else {
+                (account_balance.depth, account_balance.depth)
+            };
+
+            if prev_account.as_ref().is_none_or(|a| !account_name.starts_with(a)) {
+                last_depth = indent;
+                prev_account = Some(account_name);
+            }
+
+            let account_name = self.format_account_name(&account_balance, indent, skip, options);
             let amount_str = self.format_amount(&account_balance.balance, options);
 
-            writeln!(writer, "{} {}", account_name, amount_str)
+            writeln!(writer, "{amount_str:>20}  {account_name}")
                 .map_err(|e| ReportError::IoError(e.to_string()))?;
+        }
+
+        if options.final_total && !balances.is_empty() {
+            writeln!(writer, "{}", "-".repeat(20))
+                .map_err(|e| ReportError::IoError(e.to_string()))?;
+            // FIXME: ha ha actual total goes here
+            writeln!(writer, "{:>20}", "0").map_err(|e| ReportError::IoError(e.to_string()))?;
         }
 
         Ok(())

@@ -4,10 +4,9 @@
 //! handlers and managing the execution flow.
 
 use crate::cli::{Cli, Command};
-use crate::commands::register::register;
-use crate::completion;
 use crate::help::{show_man_page, HelpTopic};
 use crate::session::Session;
+use crate::{commands, completion};
 use anyhow::{Context, Result};
 use clap::CommandFactory;
 use ledger_core::parser::JournalParser;
@@ -120,8 +119,8 @@ impl Dispatcher {
     /// Execute a main command that requires journal files
     fn execute_command(&mut self, command: &Command) -> Result<i32> {
         match command {
-            Command::Balance(args) => self.execute_balance_command(args),
-            Command::Register(args) => register(&self.session, args),
+            Command::Balance(args) => commands::balance::balance(&self.session, args),
+            Command::Register(args) => commands::register::register(&self.session, args),
             Command::Print(args) => self.execute_print_command(args),
             Command::Accounts(args) => self.execute_accounts_command(args),
             Command::Commodities(args) => self.execute_commodities_command(args),
@@ -273,45 +272,6 @@ impl Dispatcher {
 // Command implementations - these will be expanded with actual functionality
 
 impl Dispatcher {
-    fn execute_balance_command(&mut self, args: &crate::cli::BalanceArgs) -> Result<i32> {
-        // Get the parsed journal
-        let journal = match &self.session.parsed_journal {
-            Some(journal) => journal,
-            None => {
-                return Err(anyhow::anyhow!("No journal loaded"));
-            }
-        };
-
-        println!("CLI Demo - Balance Report");
-        println!("========================");
-
-        // Show basic journal info
-        println!("Transactions loaded: {}", journal.transactions.len());
-        println!("Accounts created: {}", journal.accounts.len());
-
-        // Show accounts if --empty specified
-        if args.empty {
-            println!("\nAccounts:");
-            for name in journal.accounts.keys() {
-                println!("  {}", name);
-            }
-        }
-
-        if !args.pattern.is_empty() {
-            println!("Account patterns (not yet implemented): {:?}", args.pattern);
-        }
-
-        if args.flat {
-            println!("Flat account listing enabled");
-        }
-
-        if let Some(depth) = args.depth {
-            println!("Max depth: {}", depth);
-        }
-
-        Ok(0)
-    }
-
     fn execute_print_command(&mut self, args: &crate::cli::PrintArgs) -> Result<i32> {
         // Get the parsed journal
         let journal = match &self.session.parsed_journal {
@@ -344,7 +304,7 @@ impl Dispatcher {
         };
 
         let pattern = if !args.pattern.is_empty() {
-            let pattern = args.pattern.join("|");
+            let pattern = args.pattern.join("*.|.*");
             let pattern = format!(".*(?i:{pattern}).*");
             Some(Regex::new(&pattern).unwrap())
         } else {
@@ -376,7 +336,7 @@ impl Dispatcher {
 
         let mut commodities: Vec<&Arc<Commodity>> = if !args.pattern.is_empty() {
             let pattern = {
-                let pattern = args.pattern.join("|");
+                let pattern = args.pattern.join("*.|.*");
                 let pattern = format!(".*(?i:{pattern}).*");
                 Regex::new(&pattern).unwrap()
             };
@@ -417,7 +377,7 @@ impl Dispatcher {
         };
 
         let pattern = if !args.pattern.is_empty() {
-            let pattern = args.pattern.join("|");
+            let pattern = args.pattern.join("*.|.*");
             let pattern = format!(".*(?i:{pattern}).*");
             Some(Regex::new(&pattern).unwrap())
         } else {

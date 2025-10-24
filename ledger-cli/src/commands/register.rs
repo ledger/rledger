@@ -35,7 +35,7 @@ fn write_report(
         .with_show_related(args.related);
 
     let mut report = if !args.pattern.is_empty() {
-        let pattern = args.pattern.join("|");
+        let pattern = args.pattern.join("*.|.*");
         let pattern = format!(".*(?i:{pattern}).*");
 
         report.with_posting_filter(Box::new(
