@@ -96,7 +96,11 @@ impl BaselineRunner {
             }
 
             // Parse the test file
-            let test_suite = self.discovery.parser.parse_file(path, TestCategory::Baseline)?;
+            let test_suite = self.discovery.parser.parse_file(
+                path,
+                TestCategory::Baseline,
+                &self.config.patterns,
+            )?;
 
             // Skip empty test files
             if test_suite.is_empty() {
@@ -217,7 +221,11 @@ impl BaselineRunner {
             )));
         }
 
-        let test_suite = self.discovery.parser.parse_file(test_file, TestCategory::Baseline)?;
+        let test_suite = self.discovery.parser.parse_file(
+            test_file,
+            TestCategory::Baseline,
+            &self.config.patterns,
+        )?;
 
         if test_suite.is_empty() {
             return Err(TestError::Discovery("Empty test file".to_string()));
