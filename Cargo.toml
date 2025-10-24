@@ -40,9 +40,11 @@ bitflags = "2.4"
 nom = "7.1"
 
 # Testing dependencies
+insta = "1.43.2"
 proptest = "1.4"
 quickcheck = "1.0"
 criterion = "0.5"
+textwrap = "0.16.2"
 
 # Performance optimization dependencies
 smallvec = "1.13"
@@ -84,4 +86,4 @@ opt-level = 3
 lto = "fat"
 codegen-units = 1
 panic = "abort"
-target-cpu = "native"
+# target-cpu = "native"

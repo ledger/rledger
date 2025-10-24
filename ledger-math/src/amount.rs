@@ -567,15 +567,8 @@ impl Amount {
     /// Check if two amounts have compatible commodities for arithmetic
     fn check_commodity_compatibility(&self, other: &Amount) -> AmountResult<()> {
         match (&self.commodity, &other.commodity) {
-            (None, None) => Ok(()),
-            (Some(_), None) | (None, Some(_)) => Ok(()),
-            (Some(a), Some(b)) => {
-                if std::ptr::eq(a.as_ref(), b.as_ref()) {
-                    Ok(())
-                } else {
-                    Err(AmountError::CommodityMismatch)
-                }
-            }
+            (Some(a), Some(b)) if a.symbol() != b.symbol() => Err(AmountError::CommodityMismatch),
+            (Some(_), Some(_)) | (Some(_), None) | (None, Some(_)) | (None, None) => Ok(()),
         }
     }
 

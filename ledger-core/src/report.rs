@@ -565,9 +565,12 @@ impl RegisterReport {
         self
     }
 
-    /// Collect register entries with running balances
-    fn collect_entries(&mut self, options: &ReportOptions) -> ReportResult<Vec<RegisterEntry>> {
-        let mut entries = Vec::new();
+    /// Collect register entries with running balances, grouped by transaction
+    fn collect_entries(
+        &mut self,
+        options: &ReportOptions,
+    ) -> ReportResult<Vec<Vec<RegisterEntry>>> {
+        let mut transaction_entries = Vec::new();
         let mut running_balance = crate::balance::Balance::new();
 
         // Process all transactions in chronological order
@@ -575,6 +578,7 @@ impl RegisterReport {
         transactions.sort_by_key(|tx| tx.date);
 
         for transaction in transactions {
+            let mut posting_entries = Vec::new();
             // Apply transaction-level filters
             if !self.transaction_filters.matches(transaction) {
                 continue;
@@ -638,125 +642,172 @@ impl RegisterReport {
                         related_accounts,
                     };
 
-                    entries.push(entry);
+                    posting_entries.push(entry);
                 }
             }
+            // Apply sorting if specified
+            match options.sort_by {
+                SortCriteria::Amount => {
+                    posting_entries.sort_by(|a, b| {
+                        a.date.cmp(&b.date).then_with(|| {
+                            b.amount
+                                .abs()
+                                .partial_cmp(&a.amount.abs())
+                                .unwrap_or(std::cmp::Ordering::Equal)
+                        })
+                    });
+                }
+                SortCriteria::Name => {
+                    posting_entries.sort_by(|a, b| {
+                        a.date.cmp(&b.date).then_with(|| b.account.cmp(&a.account))
+                    });
+                }
+                SortCriteria::Count => {
+                    // For register, count doesn't apply directly, keep date order
+                }
+                SortCriteria::Code => {
+                    posting_entries.sort_by(|a, b| {
+                        a.date.cmp(&b.date).then_with(|| match (&a.code, &b.code) {
+                            (Some(a_code), Some(b_code)) => a_code.cmp(b_code),
+                            (Some(_), None) => std::cmp::Ordering::Less,
+                            (None, Some(_)) => std::cmp::Ordering::Greater,
+                            (None, None) => std::cmp::Ordering::Equal,
+                        })
+                    });
+                }
+            }
+
+            transaction_entries.push(posting_entries);
         }
 
-        // Apply sorting if specified
-        match options.sort_by {
-            SortCriteria::Amount => {
-                entries.sort_by(|a, b| {
-                    b.amount.abs().partial_cmp(&a.amount.abs()).unwrap_or(std::cmp::Ordering::Equal)
-                });
-            }
-            SortCriteria::Name => {
-                entries.sort_by(|a, b| a.account.cmp(&b.account));
-            }
-            SortCriteria::Count => {
-                // For register, count doesn't apply directly, keep date order
-            }
-            SortCriteria::Code => {
-                entries.sort_by(|a, b| match (&a.code, &b.code) {
-                    (Some(a_code), Some(b_code)) => a_code.cmp(b_code),
-                    (Some(_), None) => std::cmp::Ordering::Less,
-                    (None, Some(_)) => std::cmp::Ordering::Greater,
-                    (None, None) => std::cmp::Ordering::Equal,
-                });
-            }
-        }
-
-        Ok(entries)
+        Ok(transaction_entries)
     }
 
     /// Format a register entry for display
-    fn format_entry(&self, entry: &RegisterEntry, _options: &ReportOptions) -> String {
-        let mut parts = Vec::new();
+    fn format_entry(
+        &self,
+        entry: &RegisterEntry,
+        // HACK:
+        is_posting_line: bool,
+        _options: &ReportOptions,
+    ) -> String {
+        let mut lines = Vec::new();
 
-        // Date column
-        if self.columns.date {
-            let date_str = entry.date.format("%Y-%m-%d").to_string();
-            let date_width = self.columns.widths.get("date").copied().unwrap_or(10);
-            parts.push(format!("{:<width$}", date_str, width = date_width));
-        }
+        let mut balance_amounts: Vec<_> = entry.balance.amounts_iter().collect();
+        balance_amounts.sort_by_key(|a| a.commodity().map(|c| c.symbol()).unwrap_or(""));
+        for (i, balance_amount) in balance_amounts.iter().enumerate() {
+            let pad_balance = i > 0;
+            let mut parts = Vec::new();
 
-        // Code column
-        if self.columns.code {
-            let code_str = entry.code.as_deref().unwrap_or("");
-            let code_width = self.columns.widths.get("code").copied().unwrap_or(6);
-            parts.push(format!("{:<width$}", code_str, width = code_width));
-        }
-
-        // Payee column
-        if self.columns.payee {
-            let payee_width = self
-                .columns
-                .widths
-                .get("payee")
-                .copied()
-                .unwrap_or(if self.wide_format { 30 } else { 20 });
-            let payee = if self.wide_format {
-                entry.payee.clone()
-            } else {
-                // Truncate for narrow format
-                if entry.payee.len() > payee_width {
-                    format!("{}...", &entry.payee[..payee_width - 3])
+            // Date column
+            if self.columns.date {
+                let date_str = entry.date.format("%y-%b-%d").to_string();
+                let date_width = self.columns.widths.get("date").copied().unwrap_or(9);
+                if !is_posting_line && !pad_balance {
+                    parts.push(format!("{:<width$}", date_str, width = date_width));
                 } else {
-                    entry.payee.clone()
+                    parts.push(" ".repeat(date_width).to_string());
                 }
-            };
-            parts.push(format!("{:<width$}", payee, width = payee_width));
-        }
-
-        // Account column
-        if self.columns.account {
-            let account_width = self
-                .columns
-                .widths
-                .get("account")
-                .copied()
-                .unwrap_or(if self.wide_format { 40 } else { 25 });
-            let account = if self.wide_format {
-                entry.account.clone()
-            } else {
-                // Truncate account name for narrow format
-                if entry.account.len() > account_width {
-                    format!("{}...", &entry.account[..account_width - 3])
-                } else {
-                    entry.account.clone()
-                }
-            };
-            parts.push(format!("{:<width$}", account, width = account_width));
-        }
-
-        // Amount column
-        if self.columns.amount {
-            let amount_width = self.columns.widths.get("amount").copied().unwrap_or(12);
-            let amount_str = entry.amount.to_string();
-            parts.push(format!("{:>width$}", amount_str, width = amount_width));
-        }
-
-        // Balance column
-        if self.columns.balance {
-            let balance_width = self.columns.widths.get("balance").copied().unwrap_or(15);
-            let balance_str = entry.balance.to_string();
-            parts.push(format!("{:>width$}", balance_str, width = balance_width));
-        }
-
-        // Note column
-        if self.columns.note {
-            if let Some(ref note) = entry.note {
-                let note_width = self.columns.widths.get("note").copied().unwrap_or(20);
-                let note_str = if note.len() > note_width && !self.wide_format {
-                    format!("{}...", &note[..note_width - 3])
-                } else {
-                    note.clone()
-                };
-                parts.push(format!("{:<width$}", note_str, width = note_width));
             }
+
+            // Code column
+            if self.columns.code {
+                let code_str = entry.code.as_deref().unwrap_or("");
+                let code_width = self.columns.widths.get("code").copied().unwrap_or(6);
+                if !is_posting_line && !pad_balance {
+                    parts.push(format!("{:<width$}", code_str, width = code_width));
+                } else {
+                    parts.push(" ".repeat(code_width).to_string());
+                }
+            }
+
+            // Payee column
+            if self.columns.payee {
+                let payee_width = self
+                    .columns
+                    .widths
+                    .get("payee")
+                    .copied()
+                    .unwrap_or(if self.wide_format { 30 } else { 21 });
+                let payee = if self.wide_format {
+                    entry.payee.clone()
+                } else {
+                    // Truncate for narrow format
+                    if entry.payee.len() > payee_width {
+                        format!("{}..", &entry.payee[..payee_width - 2])
+                    } else {
+                        entry.payee.clone()
+                    }
+                };
+
+                if !is_posting_line && !pad_balance {
+                    parts.push(format!("{:<width$}", payee, width = payee_width));
+                } else {
+                    parts.push(" ".repeat(payee_width).to_string());
+                }
+            }
+
+            // Account column
+            if self.columns.account {
+                let account_width = self
+                    .columns
+                    .widths
+                    .get("account")
+                    .copied()
+                    .unwrap_or(if self.wide_format { 40 } else { 22 });
+                let account = if self.wide_format {
+                    entry.account.clone()
+                } else {
+                    // Truncate account name for narrow format
+                    if entry.account.len() > account_width {
+                        format!("{}..", &entry.account[..account_width - 2])
+                    } else {
+                        entry.account.clone()
+                    }
+                };
+
+                if !pad_balance {
+                    parts.push(format!("{:<width$}", account, width = account_width));
+                } else {
+                    parts.push(" ".repeat(account_width).to_string());
+                }
+            }
+
+            // Amount column
+            if self.columns.amount {
+                let amount_width = self.columns.widths.get("amount").copied().unwrap_or(12);
+                let amount_str = entry.amount.to_string();
+                if !pad_balance {
+                    parts.push(format!("{:>width$}", amount_str, width = amount_width));
+                } else {
+                    parts.push(" ".repeat(amount_width).to_string());
+                }
+            }
+
+            // Balance column
+            if self.columns.balance {
+                let balance_width = self.columns.widths.get("balance").copied().unwrap_or(12);
+                let balance_str = balance_amount.to_string();
+                parts.push(format!("{:>width$}", balance_str, width = balance_width));
+            }
+
+            // Note column
+            if self.columns.note {
+                if let Some(ref note) = entry.note {
+                    let note_width = self.columns.widths.get("note").copied().unwrap_or(20);
+                    let note_str = if note.len() > note_width && !self.wide_format {
+                        format!("{}...", &note[..note_width - 3])
+                    } else {
+                        note.clone()
+                    };
+                    parts.push(format!("{:<width$}", note_str, width = note_width));
+                }
+            }
+
+            lines.push(parts.join(" "))
         }
 
-        parts.join(" ")
+        lines.join("\n")
     }
 
     /// Format header line for the register report
@@ -814,27 +865,30 @@ impl RegisterReport {
 impl ReportGenerator for RegisterReport {
     fn generate<W: Write>(&mut self, writer: &mut W, options: &ReportOptions) -> ReportResult<()> {
         // Collect register entries
-        let entries = self.collect_entries(options)?;
+        let transaction_entries = self.collect_entries(options)?;
 
-        // Write header
-        let header = self.format_header();
-        writeln!(writer, "{}", header).map_err(|e| ReportError::IoError(e.to_string()))?;
+        // TODO: disable header for now
+        // // Write header
+        // let header = self.format_header();
+        // writeln!(writer, "{}", header).map_err(|e| ReportError::IoError(e.to_string()))?;
 
-        // Write separator line
-        writeln!(writer, "{}", "-".repeat(header.len()))
-            .map_err(|e| ReportError::IoError(e.to_string()))?;
+        // // Write separator line
+        // writeln!(writer, "{}", "-".repeat(header.len()))
+        //     .map_err(|e| ReportError::IoError(e.to_string()))?;
 
         // Write each entry
-        for entry in entries {
-            let line = self.format_entry(&entry, options);
-            writeln!(writer, "{}", line).map_err(|e| ReportError::IoError(e.to_string()))?;
+        for posting_entries in transaction_entries {
+            for (i, entry) in posting_entries.iter().enumerate() {
+                let line = self.format_entry(&entry, i > 0, options);
+                writeln!(writer, "{}", line).map_err(|e| ReportError::IoError(e.to_string()))?;
 
-            // Show related accounts for split transactions
-            if self.show_related && entry.is_split && !entry.related_accounts.is_empty() {
-                for related in &entry.related_accounts {
-                    let indent = " ".repeat(if self.columns.date { 12 } else { 0 });
-                    writeln!(writer, "{}  -> {}", indent, related)
-                        .map_err(|e| ReportError::IoError(e.to_string()))?;
+                // Show related accounts for split transactions
+                if self.show_related && entry.is_split && !entry.related_accounts.is_empty() {
+                    for related in &entry.related_accounts {
+                        let indent = " ".repeat(if self.columns.date { 12 } else { 0 });
+                        writeln!(writer, "{}  -> {}", indent, related)
+                            .map_err(|e| ReportError::IoError(e.to_string()))?;
+                    }
                 }
             }
         }

@@ -4,7 +4,9 @@
 //! implementation of Ledger, including argument parsing, session management, and
 //! command dispatch.
 
+// NOTE: must duplicate w/o pub in main.rs
 pub mod cli;
+pub mod commands;
 pub mod completion;
 pub mod dispatch;
 pub mod help;

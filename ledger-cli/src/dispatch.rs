@@ -4,6 +4,7 @@
 //! handlers and managing the execution flow.
 
 use crate::cli::{Cli, Command};
+use crate::commands::register::register;
 use crate::completion;
 use crate::help::{show_man_page, HelpTopic};
 use crate::session::Session;
@@ -15,7 +16,6 @@ use ledger_math::Commodity;
 use regex::Regex;
 use std::collections::HashSet;
 use std::io::{self, BufWriter, Write};
-use std::ops::Add;
 use std::sync::Arc;
 
 /// Main command dispatcher
@@ -121,7 +121,7 @@ impl Dispatcher {
     fn execute_command(&mut self, command: &Command) -> Result<i32> {
         match command {
             Command::Balance(args) => self.execute_balance_command(args),
-            Command::Register(args) => self.execute_register_command(args),
+            Command::Register(args) => register(&self.session, args),
             Command::Print(args) => self.execute_print_command(args),
             Command::Accounts(args) => self.execute_accounts_command(args),
             Command::Commodities(args) => self.execute_commodities_command(args),
@@ -307,63 +307,6 @@ impl Dispatcher {
 
         if let Some(depth) = args.depth {
             println!("Max depth: {}", depth);
-        }
-
-        Ok(0)
-    }
-
-    fn execute_register_command(&mut self, args: &crate::cli::RegisterArgs) -> Result<i32> {
-        // Get the parsed journal
-        let journal = match &self.session.parsed_journal {
-            Some(journal) => journal,
-            None => {
-                return Err(anyhow::anyhow!("No journal loaded"));
-            }
-        };
-
-        println!("Demo Register Report");
-        println!("====================");
-
-        let transactions = &journal.transactions;
-        let mut running_total = ledger_math::amount::Amount::null();
-
-        for transaction in transactions {
-            let postings = &transaction.postings;
-            for posting in postings {
-                if let Some(amount) = &posting.amount {
-                    let account_name = "Demo Account"; // placeholder
-                    let desc = &transaction.payee;
-
-                    // Update running total
-                    running_total = running_total.add(amount).unwrap_or_else(|_| amount.clone());
-
-                    if args.wide {
-                        println!(
-                            "{} {:30} {:>12} {:>15}",
-                            transaction.date.format("%Y/%m/%d"),
-                            desc,
-                            account_name,
-                            amount
-                        );
-                    } else {
-                        println!(
-                            "{} {:20} {:>12} {:>12}",
-                            transaction.date.format("%Y/%m/%d"),
-                            desc,
-                            account_name,
-                            amount
-                        );
-                    }
-                }
-            }
-        }
-
-        if !args.pattern.is_empty() && self.session.verbose_enabled {
-            eprintln!("Account patterns: {:?}", args.pattern);
-        }
-
-        if args.subtotal && self.session.verbose_enabled {
-            eprintln!("Subtotal option not yet implemented");
         }
 
         Ok(0)

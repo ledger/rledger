@@ -202,7 +202,8 @@ impl Balance {
             amount.commodity().cloned().unwrap_or_else(crate::commodity::null_commodity);
 
         if let Some(existing) = self.amounts.get_mut(&commodity) {
-            *existing = (existing.clone() + amount.clone())?;
+            // *existing = (existing.clone() + amount.clone())?;
+            existing.add_amount(amount)?;
 
             // Remove the amount if it becomes zero after addition
             if existing.is_realzero() {

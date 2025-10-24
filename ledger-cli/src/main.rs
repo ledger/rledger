@@ -8,7 +8,9 @@ use clap::Parser;
 use std::env;
 use std::process;
 
+// NOTE: must duplicate w/ pub in lib.rs
 mod cli;
+mod commands;
 mod completion;
 mod dispatch;
 mod help;
