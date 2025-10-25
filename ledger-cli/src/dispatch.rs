@@ -9,6 +9,7 @@ use crate::session::Session;
 use crate::{commands, completion};
 use anyhow::{Context, Result};
 use clap::CommandFactory;
+use ledger_core::journal::Journal;
 use ledger_core::parser::JournalParser;
 use ledger_core::posting::Posting;
 use ledger_math::Commodity;
@@ -152,6 +153,9 @@ impl Dispatcher {
             return Err(anyhow::anyhow!("No journal files specified"));
         }
 
+        let mut journal = Journal::new();
+        let mut parser = JournalParser::new();
+
         for file in &self.session.journal_files {
             if self.session.verbose_enabled {
                 eprintln!("Loading journal file: {}", file.display());
@@ -161,14 +165,10 @@ impl Dispatcher {
                 return Err(anyhow::anyhow!("Journal file not found: {}", file.display()));
             }
 
-            let contents = std::fs::read_to_string(file)?;
-            let mut parser = JournalParser::new();
-            let journal = parser.parse_journal(&contents)?;
-
-            // FIXME: this only supports 1 journal file
-            // TODO: combine all input journal files into one journal
-            self.session.parsed_journal = Some(journal);
+            journal.merge(parser.parse_file(&file)?).map_err(|err| anyhow::anyhow!(err))?;
         }
+
+        self.session.parsed_journal = Some(journal);
 
         Ok(())
     }
