@@ -96,7 +96,11 @@ impl BaselineRunner {
             }
 
             // Parse the test file
-            let test_suite = self.discovery.parser.parse_file(path, TestCategory::Baseline)?;
+            let test_suite = self.discovery.parser.parse_file(
+                path,
+                TestCategory::Baseline,
+                &self.config.patterns,
+            )?;
 
             // Skip empty test files
             if test_suite.is_empty() {
@@ -144,7 +148,7 @@ impl BaselineRunner {
                 if !self.config.quiet {
                     let status_char = match result.status {
                         TestStatus::Passed => ".",
-                        TestStatus::Failed => "F",
+                        TestStatus::FailedOutput | TestStatus::FailedExitCode => "F",
                         TestStatus::Skipped => "S",
                         TestStatus::Error => "E",
                         TestStatus::Timeout => "T",
@@ -158,7 +162,10 @@ impl BaselineRunner {
                 }
 
                 // Handle immediate failure mode
-                if !self.config.continue_on_failure && result.status == TestStatus::Failed {
+                if !self.config.continue_on_failure
+                    && (result.status == TestStatus::FailedOutput
+                        || result.status == TestStatus::FailedExitCode)
+                {
                     all_results.push(result);
                     if !self.config.quiet && completed % 50 != 0 {
                         println!(" ({}/{})", completed, total_tests);
@@ -214,7 +221,11 @@ impl BaselineRunner {
             )));
         }
 
-        let test_suite = self.discovery.parser.parse_file(test_file, TestCategory::Baseline)?;
+        let test_suite = self.discovery.parser.parse_file(
+            test_file,
+            TestCategory::Baseline,
+            &self.config.patterns,
+        )?;
 
         if test_suite.is_empty() {
             return Err(TestError::Discovery("Empty test file".to_string()));

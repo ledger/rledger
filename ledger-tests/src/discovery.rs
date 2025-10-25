@@ -75,6 +75,7 @@ impl TestParser {
         &self,
         file_path: &Path,
         category: TestCategory,
+        patterns: &[String],
     ) -> Result<TestSuite, TestError> {
         let content = fs::read_to_string(file_path).map_err(|e| {
             TestError::Discovery(format!("Failed to read {}: {}", file_path.display(), e))
@@ -115,7 +116,10 @@ impl TestParser {
         // Parse test cases
         while i < lines.len() {
             if let Some(test_case) = self.parse_test_case(&lines, &mut i)? {
-                test_cases.push(test_case);
+                if patterns.is_empty() || patterns.iter().any(|pat| test_case.command.contains(pat))
+                {
+                    test_cases.push(test_case);
+                }
             } else {
                 i += 1;
             }
@@ -243,7 +247,12 @@ impl TestDiscovery {
                 continue;
             }
 
-            let suites = self.discover_category_tests(&test_dir, *category, &config.tests)?;
+            let suites = self.discover_category_tests(
+                &test_dir,
+                *category,
+                &config.tests,
+                &config.patterns,
+            )?;
             test_suites.extend(suites);
         }
 
@@ -256,6 +265,7 @@ impl TestDiscovery {
         test_dir: &Path,
         category: TestCategory,
         test_patterns: &[String],
+        command_patterns: &[String],
     ) -> Result<Vec<TestSuite>, TestError> {
         let mut test_suites = Vec::new();
 
@@ -298,7 +308,7 @@ impl TestDiscovery {
                 }
             }
 
-            let test_suite = self.parser.parse_file(path, category)?;
+            let test_suite = self.parser.parse_file(path, category, command_patterns)?;
             test_suites.push(test_suite);
         }
 

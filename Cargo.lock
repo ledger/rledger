@@ -1123,6 +1123,7 @@ dependencies = [
  "criterion",
  "dirs",
  "env_logger 0.10.2",
+ "insta",
  "ledger-core",
  "ledger-math",
  "log",
@@ -1134,6 +1135,7 @@ dependencies = [
  "serde_json",
  "similar",
  "tempfile",
+ "textwrap",
 ]
 
 [[package]]

@@ -18,6 +18,8 @@ pub struct TestStatistics {
     pub passed: usize,
     /// Number of failed tests
     pub failed: usize,
+    /// Number of failed tests due to exit code mismatch (also counted in `failed`)
+    pub failed_exit_code: usize,
     /// Number of skipped tests
     pub skipped: usize,
     /// Number of error tests
@@ -39,6 +41,7 @@ impl TestStatistics {
             total: results.len(),
             passed: 0,
             failed: 0,
+            failed_exit_code: 0,
             skipped: 0,
             errors: 0,
             timeouts: 0,
@@ -53,7 +56,11 @@ impl TestStatistics {
             // Update overall counts
             match result.status {
                 TestStatus::Passed => stats.passed += 1,
-                TestStatus::Failed => stats.failed += 1,
+                TestStatus::FailedOutput => stats.failed += 1,
+                TestStatus::FailedExitCode => {
+                    stats.failed += 1;
+                    stats.failed_exit_code += 1;
+                }
                 TestStatus::Skipped => stats.skipped += 1,
                 TestStatus::Error => stats.errors += 1,
                 TestStatus::Timeout => stats.timeouts += 1,
@@ -120,7 +127,9 @@ impl TestReport {
 
     /// Get failed test results
     pub fn failed_tests(&self) -> impl Iterator<Item = &TestResult> {
-        self.results.iter().filter(|r| r.status == TestStatus::Failed)
+        self.results.iter().filter(|r| {
+            r.status == TestStatus::FailedOutput || r.status == TestStatus::FailedExitCode
+        })
     }
 
     /// Get error test results
@@ -199,7 +208,21 @@ impl TestReport {
         println!("  {} {}", style("Passed:").green(), style(stats.passed).bold().green());
 
         if stats.failed > 0 {
-            println!("  {} {}", style("Failed:").red(), style(stats.failed).bold().red());
+            let exit_code = if stats.failed_exit_code > 0 {
+                format!(
+                    " ({} exit code {})",
+                    stats.failed_exit_code,
+                    if stats.failed_exit_code == 1 { "mismatch" } else { "mismatches" }
+                )
+            } else {
+                "".to_string()
+            };
+            println!(
+                "  {} {}{}",
+                style("Failed:").red(),
+                style(stats.failed).bold().red(),
+                style(exit_code).red()
+            );
         }
 
         if stats.skipped > 0 {
@@ -226,7 +249,7 @@ impl TestReport {
         for result in &self.results {
             let status_icon = match result.status {
                 TestStatus::Passed => style("✓").green(),
-                TestStatus::Failed => style("✗").red(),
+                TestStatus::FailedOutput | TestStatus::FailedExitCode => style("✗").red(),
                 TestStatus::Skipped => style("~").yellow(),
                 TestStatus::Error => style("!").red(),
                 TestStatus::Timeout => style("⏱").red(),
@@ -381,7 +404,7 @@ impl ProgressReporter {
 
         let status_char = match result.status {
             TestStatus::Passed => ".",
-            TestStatus::Failed => "F",
+            TestStatus::FailedOutput | TestStatus::FailedExitCode => "F",
             TestStatus::Skipped => "S",
             TestStatus::Error => "E",
             TestStatus::Timeout => "T",

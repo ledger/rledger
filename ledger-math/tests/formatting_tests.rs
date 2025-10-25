@@ -134,13 +134,15 @@ fn test_balance_debug_detailed() {
 fn test_balance_print_method() {
     let amount = Amount::from_i64(12345);
     let balance = Balance::from_amount(amount).unwrap();
-    let mut buffer = String::new();
 
-    balance.print(&mut buffer, Some(10), None, FormatFlags::NO_FLAGS).unwrap();
+    let config = FormatConfig::new().with_flags(FormatFlags::NO_FLAGS).with_width(10, None);
+    let mut buffer = String::new();
+    balance.print(&mut buffer, &config).unwrap();
     assert_eq!(buffer, "12345     ");
 
+    let config = FormatConfig::new().with_flags(FormatFlags::RIGHT_JUSTIFY).with_width(10, None);
     let mut buffer = String::new();
-    balance.print(&mut buffer, Some(10), None, FormatFlags::RIGHT_JUSTIFY).unwrap();
+    balance.print(&mut buffer, &config).unwrap();
     assert_eq!(buffer, "     12345");
 }
 

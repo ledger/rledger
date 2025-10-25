@@ -222,10 +222,19 @@ impl AccountFilter {
     }
 }
 
+impl Filter<Transaction> for AccountFilter {
+    fn matches(&self, transaction: &Transaction) -> bool {
+        transaction.postings.iter().any(|p| self.pattern.is_match(&p.account_name()))
+    }
+
+    fn description(&self) -> String {
+        format!("any posting account matches '{}'", self.original_pattern)
+    }
+}
+
 impl Filter<Posting> for AccountFilter {
     fn matches(&self, posting: &Posting) -> bool {
-        let account_name = posting.account.borrow().fullname_immutable();
-        self.pattern.is_match(&account_name)
+        self.pattern.is_match(&posting.account_name())
     }
 
     fn description(&self) -> String {
@@ -233,6 +242,7 @@ impl Filter<Posting> for AccountFilter {
     }
 }
 
+impl TransactionFilter for AccountFilter {}
 impl PostingFilter for AccountFilter {}
 
 /// Status filter for cleared/pending/uncleared items

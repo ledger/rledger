@@ -19,8 +19,10 @@ use crate::TestError;
 pub enum TestStatus {
     /// Test passed successfully
     Passed,
-    /// Test failed
-    Failed,
+    /// Test failed due to unexpected/mismatched output
+    FailedOutput,
+    /// Test failed due to unexpected exit code
+    FailedExitCode,
     /// Test was skipped
     Skipped,
     /// Test timed out
@@ -91,10 +93,15 @@ impl TestResult {
         output_comparison: Option<OutputComparison>,
         error_comparison: Option<OutputComparison>,
     ) -> Self {
+        let status = if actual_exit_code != test_case.expected_exit_code {
+            TestStatus::FailedExitCode
+        } else {
+            TestStatus::FailedOutput
+        };
         Self {
             test_case,
             suite_name,
-            status: TestStatus::Failed,
+            status,
             actual_output,
             actual_error,
             actual_exit_code,

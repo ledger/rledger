@@ -359,27 +359,31 @@ pub struct BalanceArgs {
     pub pattern: Vec<String>,
 
     /// Show empty accounts
-    #[arg(long = "empty")]
+    #[arg(long, short = 'E')]
     pub empty: bool,
 
     /// Show flat account listing
-    #[arg(long = "flat")]
+    #[arg(long)]
     pub flat: bool,
 
+    /// Print only the top level accounts.
+    #[arg(long, short = 'n')]
+    pub collapse: bool,
+
     /// Collapse accounts to specified depth
-    #[arg(long = "depth")]
+    #[arg(long)]
     pub depth: Option<usize>,
 
     /// Don't show accounts with zero balance
-    #[arg(long = "no-total")]
+    #[arg(long)]
     pub no_total: bool,
 
     /// Show accounts by percent of total
-    #[arg(long = "percent")]
+    #[arg(long, short = '%')]
     pub percent: bool,
 
     /// Show accounts with inverted sign
-    #[arg(long = "invert")]
+    #[arg(long)]
     pub invert: bool,
 }
 

@@ -11,6 +11,7 @@ use std::sync::Arc;
 
 use crate::amount::{Amount, AmountError};
 use crate::commodity::{Commodity, CommodityRef, KeepDetails};
+use crate::{format_balance, FormatConfig};
 
 /// Error type for balance operations
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -202,7 +203,8 @@ impl Balance {
             amount.commodity().cloned().unwrap_or_else(crate::commodity::null_commodity);
 
         if let Some(existing) = self.amounts.get_mut(&commodity) {
-            *existing = (existing.clone() + amount.clone())?;
+            // *existing = (existing.clone() + amount.clone())?;
+            existing.add_amount(amount)?;
 
             // Remove the amount if it becomes zero after addition
             if existing.is_realzero() {
@@ -326,25 +328,8 @@ impl Balance {
     }
 
     /// Print this balance to a stream with formatting options
-    /// Matches C++ balance_t::print() method signature
-    pub fn print<W: fmt::Write>(
-        &self,
-        writer: &mut W,
-        first_width: Option<usize>,
-        latter_width: Option<usize>,
-        flags: crate::formatting::FormatFlags,
-    ) -> fmt::Result {
-        use crate::formatting::{format_balance, FormatConfig};
-
-        let mut config = FormatConfig::default().with_flags(flags);
-
-        if let Some(width) = first_width {
-            config.min_width = Some(width);
-            config.max_width = latter_width;
-        }
-
-        let formatted = format_balance(self, &config);
-        write!(writer, "{}", formatted)
+    pub fn print<W: fmt::Write>(&self, writer: &mut W, config: &FormatConfig) -> fmt::Result {
+        write!(writer, "{}", format_balance(self, &config))
     }
 }
 

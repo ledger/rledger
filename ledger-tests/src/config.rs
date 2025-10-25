@@ -88,9 +88,13 @@ pub struct TestConfig {
     #[arg(long, value_enum, value_delimiter = ',', default_values_t = [TestCategory::Baseline, TestCategory::Regress])]
     pub categories: Vec<TestCategory>,
 
-    /// Specific test files or patterns to run
+    /// Limit tests to files matching a pattern
     #[arg(long)]
     pub tests: Vec<String>,
+
+    /// Limit tests to ledger commands matching a pattern
+    #[arg(long)]
+    pub patterns: Vec<String>,
 
     /// Enable verification mode (equivalent to --verify flag)
     #[arg(long)]
@@ -154,6 +158,7 @@ impl TestConfig {
             source_path,
             categories: vec![TestCategory::Baseline, TestCategory::Regress],
             tests: Vec::new(),
+            patterns: Vec::new(),
             verify: false,
             memory_debug: false,
             python: false,

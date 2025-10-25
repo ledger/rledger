@@ -4,18 +4,18 @@
 //! handlers and managing the execution flow.
 
 use crate::cli::{Cli, Command};
-use crate::completion;
 use crate::help::{show_man_page, HelpTopic};
 use crate::session::Session;
+use crate::{commands, completion};
 use anyhow::{Context, Result};
 use clap::CommandFactory;
+use ledger_core::journal::Journal;
 use ledger_core::parser::JournalParser;
 use ledger_core::posting::Posting;
 use ledger_math::Commodity;
 use regex::Regex;
 use std::collections::HashSet;
-use std::io::{self, BufWriter, Write};
-use std::ops::Add;
+use std::io::{self, Write};
 use std::sync::Arc;
 
 /// Main command dispatcher
@@ -120,9 +120,9 @@ impl Dispatcher {
     /// Execute a main command that requires journal files
     fn execute_command(&mut self, command: &Command) -> Result<i32> {
         match command {
-            Command::Balance(args) => self.execute_balance_command(args),
-            Command::Register(args) => self.execute_register_command(args),
-            Command::Print(args) => self.execute_print_command(args),
+            Command::Balance(args) => commands::balance::balance(&self.session, args),
+            Command::Register(args) => commands::register::register(&self.session, args),
+            Command::Print(args) => commands::print::print(&self.session, args),
             Command::Accounts(args) => self.execute_accounts_command(args),
             Command::Commodities(args) => self.execute_commodities_command(args),
             Command::Payees(args) => self.execute_payees_command(args),
@@ -153,6 +153,9 @@ impl Dispatcher {
             return Err(anyhow::anyhow!("No journal files specified"));
         }
 
+        let mut journal = Journal::new();
+        let mut parser = JournalParser::new();
+
         for file in &self.session.journal_files {
             if self.session.verbose_enabled {
                 eprintln!("Loading journal file: {}", file.display());
@@ -162,14 +165,10 @@ impl Dispatcher {
                 return Err(anyhow::anyhow!("Journal file not found: {}", file.display()));
             }
 
-            let contents = std::fs::read_to_string(file)?;
-            let mut parser = JournalParser::new();
-            let journal = parser.parse_journal(&contents)?;
-
-            // FIXME: this only supports 1 journal file
-            // TODO: combine all input journal files into one journal
-            self.session.parsed_journal = Some(journal);
+            journal.merge(parser.parse_file(&file)?).map_err(|err| anyhow::anyhow!(err))?;
         }
+
+        self.session.parsed_journal = Some(journal);
 
         Ok(())
     }
@@ -273,125 +272,6 @@ impl Dispatcher {
 // Command implementations - these will be expanded with actual functionality
 
 impl Dispatcher {
-    fn execute_balance_command(&mut self, args: &crate::cli::BalanceArgs) -> Result<i32> {
-        // Get the parsed journal
-        let journal = match &self.session.parsed_journal {
-            Some(journal) => journal,
-            None => {
-                return Err(anyhow::anyhow!("No journal loaded"));
-            }
-        };
-
-        println!("CLI Demo - Balance Report");
-        println!("========================");
-
-        // Show basic journal info
-        println!("Transactions loaded: {}", journal.transactions.len());
-        println!("Accounts created: {}", journal.accounts.len());
-
-        // Show accounts if --empty specified
-        if args.empty {
-            println!("\nAccounts:");
-            for name in journal.accounts.keys() {
-                println!("  {}", name);
-            }
-        }
-
-        if !args.pattern.is_empty() {
-            println!("Account patterns (not yet implemented): {:?}", args.pattern);
-        }
-
-        if args.flat {
-            println!("Flat account listing enabled");
-        }
-
-        if let Some(depth) = args.depth {
-            println!("Max depth: {}", depth);
-        }
-
-        Ok(0)
-    }
-
-    fn execute_register_command(&mut self, args: &crate::cli::RegisterArgs) -> Result<i32> {
-        // Get the parsed journal
-        let journal = match &self.session.parsed_journal {
-            Some(journal) => journal,
-            None => {
-                return Err(anyhow::anyhow!("No journal loaded"));
-            }
-        };
-
-        println!("Demo Register Report");
-        println!("====================");
-
-        let transactions = &journal.transactions;
-        let mut running_total = ledger_math::amount::Amount::null();
-
-        for transaction in transactions {
-            let postings = &transaction.postings;
-            for posting in postings {
-                if let Some(amount) = &posting.amount {
-                    let account_name = "Demo Account"; // placeholder
-                    let desc = &transaction.payee;
-
-                    // Update running total
-                    running_total = running_total.add(amount).unwrap_or_else(|_| amount.clone());
-
-                    if args.wide {
-                        println!(
-                            "{} {:30} {:>12} {:>15}",
-                            transaction.date.format("%Y/%m/%d"),
-                            desc,
-                            account_name,
-                            amount
-                        );
-                    } else {
-                        println!(
-                            "{} {:20} {:>12} {:>12}",
-                            transaction.date.format("%Y/%m/%d"),
-                            desc,
-                            account_name,
-                            amount
-                        );
-                    }
-                }
-            }
-        }
-
-        if !args.pattern.is_empty() && self.session.verbose_enabled {
-            eprintln!("Account patterns: {:?}", args.pattern);
-        }
-
-        if args.subtotal && self.session.verbose_enabled {
-            eprintln!("Subtotal option not yet implemented");
-        }
-
-        Ok(0)
-    }
-
-    fn execute_print_command(&mut self, args: &crate::cli::PrintArgs) -> Result<i32> {
-        // Get the parsed journal
-        let journal = match &self.session.parsed_journal {
-            Some(journal) => journal,
-            None => {
-                return Err(anyhow::anyhow!("No journal loaded"));
-            }
-        };
-
-        let mut writer = BufWriter::new(io::stdout());
-        journal.write_transactions(&mut writer)?;
-
-        if !args.pattern.is_empty() && self.session.verbose_enabled {
-            eprintln!("Account patterns: {:?}", args.pattern);
-        }
-
-        if args.raw && self.session.verbose_enabled {
-            eprintln!("Raw format option not yet implemented");
-        }
-
-        Ok(0)
-    }
-
     fn execute_accounts_command(&mut self, args: &crate::cli::AccountsArgs) -> Result<i32> {
         let journal = match &self.session.parsed_journal {
             Some(journal) => journal,
@@ -401,7 +281,7 @@ impl Dispatcher {
         };
 
         let pattern = if !args.pattern.is_empty() {
-            let pattern = args.pattern.join("|");
+            let pattern = args.pattern.join("*.|.*");
             let pattern = format!(".*(?i:{pattern}).*");
             Some(Regex::new(&pattern).unwrap())
         } else {
@@ -433,7 +313,7 @@ impl Dispatcher {
 
         let mut commodities: Vec<&Arc<Commodity>> = if !args.pattern.is_empty() {
             let pattern = {
-                let pattern = args.pattern.join("|");
+                let pattern = args.pattern.join("*.|.*");
                 let pattern = format!(".*(?i:{pattern}).*");
                 Regex::new(&pattern).unwrap()
             };
@@ -474,7 +354,7 @@ impl Dispatcher {
         };
 
         let pattern = if !args.pattern.is_empty() {
-            let pattern = args.pattern.join("|");
+            let pattern = args.pattern.join("*.|.*");
             let pattern = format!(".*(?i:{pattern}).*");
             Some(Regex::new(&pattern).unwrap())
         } else {
