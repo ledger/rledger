@@ -13,7 +13,7 @@ use nom::{
     branch::alt,
     bytes::complete::{is_not, take_until, take_while_m_n},
     character::complete::{char, digit1, line_ending, space0, space1},
-    combinator::{map, not, opt, recognize, success, value},
+    combinator::{map, not, opt, success, value, verify},
     error::{context, ParseError},
     multi::{many0, many1, many_m_n},
     sequence::{delimited, pair, preceded, terminated, tuple},
@@ -22,7 +22,6 @@ use nom::{
 
 // We need to use bytes for tag with byte strings
 
-use std::cell::RefCell;
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::{BufRead, BufReader};
@@ -30,6 +29,10 @@ use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::str::FromStr;
 use std::sync::Arc;
+use std::{
+    cell::RefCell,
+    sync::{LazyLock, Mutex},
+};
 
 use crate::{
     account::Account,
@@ -40,7 +43,7 @@ use crate::{
     transaction::{TagData, Transaction},
 };
 
-use chrono::NaiveDate;
+use chrono::{Datelike, Local, NaiveDate};
 use rust_decimal::Decimal;
 
 /// Custom error type for parser errors with source location tracking
@@ -98,6 +101,11 @@ fn tag<'a>(s: &'a str) -> impl Fn(&'a str) -> ParseResult<'a, &'a str> + 'a {
         }
     }
 }
+
+/// Global parse state.
+// FIXME: reset this for each test
+static PARSE_STATE: LazyLock<Mutex<ParseContext>> =
+    LazyLock::new(|| Mutex::new(ParseContext::default()));
 
 /// Parser state structure for context management
 #[derive(Debug, Clone)]
@@ -475,7 +483,9 @@ impl JournalParser {
         }
     }
 
-    /// Process a parsed directive with include handling
+    /// Process a parsed directive with include handling. Happens after entire
+    /// journal is parsed. For processing directives during parse, see
+    /// `process_directive_inline`
     fn process_directive(
         &mut self,
         journal: &mut Journal,
@@ -539,7 +549,23 @@ impl JournalParser {
                     postings.len()
                 );
             }
-            // Handle other directives
+            // TODO:
+            // Directive::Alias { account, alias } => todo!(),
+            // Directive::Apply { state } => todo!(),
+            // Directive::End => todo!(),
+            // Directive::Assert { condition } => todo!(),
+            // Directive::Check { condition } => todo!(),
+            // Directive::DefaultCommodity { symbol } => todo!(),
+            // Directive::Price { date, commodity, price } => todo!(),
+            // Directive::Payee { name, declarations } => todo!(),
+            // Directive::Tag { name } => todo!(),
+            // Directive::Option { name, value } => todo!(),
+            // Directive::Eval { expression } => todo!(),
+            // Directive::Define { name, expression } => todo!(),
+
+            // no after-parse processing for these directives
+            Directive::Year { .. } => {}
+
             _ => {}
         }
 
@@ -1254,49 +1280,35 @@ fn parse_transaction(input: &str) -> ParseResult<'_, Transaction> {
 
 /// Parse a date field
 fn date_field(input: &str) -> ParseResult<'_, NaiveDate> {
-    // Parse date in various formats
-    alt((
-        // ISO date format: 2021-01-01
-        map(recognize(tuple((digit1, tag("-"), digit1, tag("-"), digit1))), |date_str: &str| {
-            // Parse YYYY-MM-DD format
-            let parts: Vec<&str> = date_str.split('-').collect();
-            if parts.len() == 3 {
-                let year = parts[0].parse::<i32>().unwrap_or(2024);
-                let month = parts[1].parse::<u32>().unwrap_or(1);
-                let day = parts[2].parse::<u32>().unwrap_or(1);
-                NaiveDate::from_ymd_opt(year, month, day)
-                    .unwrap_or_else(|| NaiveDate::from_ymd_opt(2024, 1, 1).unwrap())
+    let date_with_optional_year = |sep| {
+        tuple((
+            opt(terminated(verify(digit1, |s: &str| s.len() == 4), tag(sep))),
+            terminated(verify(digit1, |s: &str| (1..=2).contains(&s.len())), tag(sep)),
+            terminated(verify(digit1, |s: &str| (1..=2).contains(&s.len())), not(tag(sep))),
+        ))
+    };
+
+    map(
+        alt((
+            date_with_optional_year("/"),
+            date_with_optional_year("-"),
+            date_with_optional_year("."),
+        )),
+        |(year, month, day)| {
+            let default_year =
+                PARSE_STATE.lock().unwrap().current_year.unwrap_or_else(|| Local::now().year());
+
+            let year = if let Some(year) = year {
+                year.parse::<i32>().unwrap_or(default_year)
             } else {
-                NaiveDate::from_ymd_opt(2024, 1, 1).unwrap()
-            }
-        }),
-        // Slash format: 2021/01/01 or 01/01
-        map(
-            recognize(tuple((digit1, tag("/"), digit1, opt(tuple((tag("/"), digit1)))))),
-            |date_str: &str| {
-                // Parse date string with slashes
-                let parts: Vec<&str> = date_str.split('/').collect();
-                if parts.len() == 3 {
-                    // YYYY/MM/DD format
-                    let year = parts[0].parse::<i32>().unwrap_or(2024);
-                    let month = parts[1].parse::<u32>().unwrap_or(1);
-                    let day = parts[2].parse::<u32>().unwrap_or(1);
-                    NaiveDate::from_ymd_opt(year, month, day)
-                        .unwrap_or_else(|| NaiveDate::from_ymd_opt(2024, 1, 1).unwrap())
-                } else if parts.len() == 2 {
-                    // MM/DD format - assume current year
-                    use chrono::{Datelike, Local};
-                    let current_year = Local::now().year();
-                    let month = parts[0].parse::<u32>().unwrap_or(1);
-                    let day = parts[1].parse::<u32>().unwrap_or(1);
-                    NaiveDate::from_ymd_opt(current_year, month, day)
-                        .unwrap_or_else(|| NaiveDate::from_ymd_opt(2024, 1, 1).unwrap())
-                } else {
-                    NaiveDate::from_ymd_opt(2024, 1, 1).unwrap()
-                }
-            },
-        ),
-    ))(input)
+                default_year
+            };
+            let month = month.parse::<u32>().unwrap_or(1);
+            let day = day.parse::<u32>().unwrap_or(1);
+
+            NaiveDate::from_ymd_opt(year, month, day).unwrap()
+        },
+    )(input)
 }
 
 /// Parse payee description
@@ -1623,26 +1635,59 @@ fn directive_entry(input: &str) -> ParseResult<'_, Directive> {
 
 /// Parse any directive
 fn parse_directive(input: &str) -> ParseResult<'_, Directive> {
-    alt((
-        account_directive,
-        commodity_directive,
-        include_directive,
-        price_directive,
-        alias_directive,
-        apply_directive,
-        end_directive,
-        payee_directive,
-        tag_directive,
-        option_directive,
-        eval_directive,
-        define_directive,
-        year_directive,
-        default_commodity_directive,
-        assert_directive,
-        check_directive,
-        periodic_transaction,
-        automated_transaction,
-    ))(input)
+    map(
+        alt((
+            account_directive,
+            commodity_directive,
+            include_directive,
+            price_directive,
+            alias_directive,
+            apply_directive,
+            end_directive,
+            payee_directive,
+            tag_directive,
+            option_directive,
+            eval_directive,
+            define_directive,
+            year_directive,
+            default_commodity_directive,
+            assert_directive,
+            check_directive,
+            periodic_transaction,
+            automated_transaction,
+        )),
+        process_directive_inline,
+    )(input)
+}
+
+/// Process directives inline, as they are parsed.
+fn process_directive_inline(directive: Directive) -> Directive {
+    match directive {
+        Directive::Year { year } => {
+            PARSE_STATE.lock().unwrap().current_year = Some(year);
+        }
+
+        // no inline processing for these directives
+        Directive::Account { .. }
+        | Directive::Alias { .. }
+        | Directive::Apply { .. }
+        | Directive::End
+        | Directive::Assert { .. }
+        | Directive::Check { .. }
+        | Directive::Commodity { .. }
+        | Directive::DefaultCommodity { .. }
+        | Directive::Price { .. }
+        | Directive::Include { .. }
+        | Directive::ConditionalInclude { .. }
+        | Directive::Payee { .. }
+        | Directive::Tag { .. }
+        | Directive::Option { .. }
+        | Directive::Eval { .. }
+        | Directive::Define { .. }
+        | Directive::PeriodicTransaction { .. }
+        | Directive::AutomatedTransaction { .. } => {}
+    }
+    directive
 }
 
 /// Parse account directive
@@ -1831,9 +1876,14 @@ fn define_directive(input: &str) -> ParseResult<'_, Directive> {
 
 /// Parse year directive
 fn year_directive(input: &str) -> ParseResult<'_, Directive> {
-    map(preceded(tag("year"), preceded(space1, digit1)), |year_str: &str| Directive::Year {
-        year: year_str.parse().unwrap_or(2024),
-    })(input)
+    // FIXME: invalid year should be an error
+    map(
+        preceded(
+            pair(alt((tag("year"), tag("Y"))), space1),
+            verify(digit1, |s: &str| s.len() == 4),
+        ),
+        |year_str: &str| Directive::Year { year: year_str.parse().unwrap_or(2024) },
+    )(input)
 }
 
 /// Parse default commodity directive
@@ -2060,6 +2110,65 @@ mod tests {
         let (line, column) = parser.get_line_column(input, error_pos);
         assert_eq!(line, 3);
         assert_eq!(column, 1);
+    }
+
+    #[test]
+    fn test_year_directive() {
+        let (_, year) = year_directive("year 1999").unwrap();
+        let Directive::Year { year } = year else {
+            panic!("did not parse `year` directive");
+        };
+
+        assert_eq!(1999, year);
+
+        let (_, year) = year_directive("Y 2020").unwrap();
+        let Directive::Year { year } = year else {
+            panic!("did not parse `Y` directive");
+        };
+
+        assert_eq!(2020, year);
+    }
+
+    #[test]
+    fn test_parse_dates() {
+        let (_, date) = date_field("2023/01/02").unwrap();
+        assert_eq!(2023, date.year());
+        assert_eq!(1, date.month());
+        assert_eq!(2, date.day());
+        let (_, date1) = date_field("2023.01.02").unwrap();
+        assert_eq!(date, date1);
+        let (_, date2) = date_field("2023-01-02").unwrap();
+        assert_eq!(date, date2);
+
+        // TODO: invalid
+        // let (_, date) = date_field("2023-01/02").unwrap();
+
+        // year optional
+        PARSE_STATE.lock().unwrap().current_year = Some(1999);
+        let (_, date) = date_field("02/03").unwrap();
+        assert_eq!(1999, date.year());
+        assert_eq!(2, date.month());
+        assert_eq!(3, date.day());
+        let (_, date1) = date_field("02.03").unwrap();
+        assert_eq!(date, date1);
+        let (_, date2) = date_field("02-03").unwrap();
+        assert_eq!(date, date2);
+
+        // 1 digit day & month
+        PARSE_STATE.lock().unwrap().current_year = Some(2005);
+        let (_, date) = date_field("4/5").unwrap();
+        assert_eq!(2005, date.year());
+        assert_eq!(4, date.month());
+        assert_eq!(5, date.day());
+
+        // TODO: current year is default; mock now() for testing (ie #[cfg(test)])
+        // let (_, date) = date_field("02/03").unwrap();
+        // assert_eq!(2025, date.year());
+        // assert_eq!(2, date.month());
+        // assert_eq!(3, date.day());
+
+        // 2 digit years are not allowed
+        assert!(date_field("25/04/05").is_err());
     }
 
     #[test]

@@ -140,4 +140,25 @@ mod tests {
                 Actif:SSB                              1821,54 $
         "#);
     }
+
+    #[test]
+    fn test_parse_and_format_journal_optional_year() {
+        let input = textwrap::dedent(
+            "
+            year 1999
+
+            11/01 A
+                B  $1
+                C
+            ",
+        );
+        let mut parser = JournalParser::new();
+        let journal = parser.parse_journal(&input).unwrap();
+
+        assert_snapshot!(journal.format_transactions(), @r#"
+            1999/11/01 A
+                B                                             $1
+                C
+        "#);
+    }
 }
