@@ -1223,67 +1223,67 @@ fn transaction_entry(input: &str) -> ParseResult<'_, Transaction> {
 
 /// Parse a complete transaction with metadata support
 fn parse_transaction(input: &str) -> ParseResult<'_, Transaction> {
-    map(
-        tuple((
-            date_field,
-            opt(preceded(tag("="), date_field)), // aux date
-            space0,
-            opt(alt((tag("*"), tag("!")))), // cleared flag
-            space0,
-            opt(delimited(tag("("), take_until(")"), tag(")"))), // code
-            space0,
-            opt(payee_description),
-            space0,
-            // transaction comment on payee line
-            opt(simple_comment_field),
-            line_ending,
-            // transaction comments between payees and postings
-            many0(delimited(alt((space1, tag("\t"))), simple_comment_field, line_ending)),
-            many0(posting_line),
-        )),
-        |(date, aux_date, _, cleared, _, code, _, payee, _, comment1, _, comment2, postings)| {
-            let payee_str = payee.unwrap_or_else(String::new);
-            let mut transaction = Transaction::new(date, payee_str);
+    let mut parser = tuple((
+        date_field,
+        opt(preceded(tag("="), date_field)), // aux date
+        space0,
+        opt(alt((tag("*"), tag("!")))), // cleared flag
+        space0,
+        opt(delimited(tag("("), take_until(")"), tag(")"))), // code
+        space0,
+        opt(payee_description),
+        space0,
+        // transaction comment on payee line
+        opt(simple_comment_field),
+        line_ending,
+        // transaction comments between payees and postings
+        many0(delimited(alt((space1, tag("\t"))), simple_comment_field, line_ending)),
+        many0(posting_line),
+    ));
 
-            if let Some(aux_date) = aux_date {
-                transaction.set_aux_date(Some(aux_date));
-            }
+    let (rest, (date, aux_date, _, cleared, _, code, _, payee, _, comment1, _, comment2, postings)) =
+        parser(input)?;
 
-            if let Some(cleared) = cleared {
-                match cleared {
-                    "*" => transaction.set_status(crate::transaction::TransactionStatus::Cleared),
-                    "!" => transaction.set_status(crate::transaction::TransactionStatus::Pending),
-                    _ => {}
-                }
-            }
+    let payee_str = payee.unwrap_or_else(String::new);
+    let mut transaction = Transaction::new(date, payee_str);
 
-            if let Some(code) = code {
-                transaction.set_code(Some(code.to_string()));
-            }
+    if let Some(aux_date) = aux_date {
+        transaction.set_aux_date(Some(aux_date));
+    }
 
-            // Extract metadata from transaction comment
-            if comment1.is_some() || !comment2.is_empty() {
-                let comment = [comment1.unwrap_or_default(), comment2.join("\n")].join("\n");
-                let metadata = parse_metadata_tags(&comment, None);
+    if let Some(cleared) = cleared {
+        match cleared {
+            "*" => transaction.set_status(crate::transaction::TransactionStatus::Cleared),
+            "!" => transaction.set_status(crate::transaction::TransactionStatus::Pending),
+            _ => {}
+        }
+    }
 
-                transaction.note = Some(comment);
+    if let Some(code) = code {
+        transaction.set_code(Some(code.to_string()));
+    }
 
-                if let Some(payee) = metadata.get("Payee") {
-                    transaction.payee = payee.clone();
-                }
+    // Extract metadata from transaction comment
+    if comment1.is_some() || !comment2.is_empty() {
+        let comment = [comment1.unwrap_or_default(), comment2.join("\n")].join("\n");
+        let metadata = parse_metadata_tags(&comment, None);
 
-                let metadata: HashMap<String, TagData> =
-                    metadata.into_iter().map(|(key, value)| (key, TagData::new(value))).collect();
-                transaction.metadata.extend(metadata);
-            }
+        transaction.note = Some(comment);
 
-            for posting in postings {
-                transaction.add_posting(posting);
-            }
+        if let Some(payee) = metadata.get("Payee") {
+            transaction.payee = payee.clone();
+        }
 
-            transaction
-        },
-    )(input)
+        let metadata: HashMap<String, TagData> =
+            metadata.into_iter().map(|(key, value)| (key, TagData::new(value))).collect();
+        transaction.metadata.extend(metadata);
+    }
+
+    for posting in postings {
+        transaction.add_posting(posting);
+    }
+
+    Ok((rest, transaction))
 }
 
 /// Parse a date field
@@ -1333,84 +1333,84 @@ fn posting_line(input: &str) -> ParseResult<'_, Posting> {
 pub(crate) fn parse_posting(input: &str) -> ParseResult<'_, Posting> {
     // For now, create a simplified version that compiles
     // TODO: Fix account reference creation and metadata handling
-    map(
-        tuple((
-            account_name,
-            opt(tuple((
-                // amount
-                preceded(pair(alt((tag("  "), tag("\t"))), space0), simple_amount_field),
-                // lot price
-                opt(delimited(
-                    space0,
-                    alt((
-                        map(delimited(char('{'), simple_amount_field, char('}')), |a| (false, a)),
-                        map(delimited(tag("{{"), simple_amount_field, tag("}}")), |a| (true, a)),
-                    )),
-                    space0,
+    let mut parser = tuple((
+        account_name,
+        opt(tuple((
+            // amount
+            preceded(pair(alt((tag("  "), tag("\t"))), space0), simple_amount_field),
+            // lot price
+            opt(delimited(
+                space0,
+                alt((
+                    map(delimited(char('{'), simple_amount_field, char('}')), |a| (false, a)),
+                    map(delimited(tag("{{"), simple_amount_field, tag("}}")), |a| (true, a)),
                 )),
-                // cost
-                opt(pair(
-                    delimited(space0, map(many_m_n(1, 2, char('@')), |r| r.len() == 2), space0),
-                    simple_amount_field,
-                )),
-            ))),
-            opt(preceded(space0, simple_comment_field)),
-            opt(line_ending),
-        )),
-        |(account, amount_price_cost, comment, _)| {
-            // Create a dummy account reference for now
-            // TODO: Proper account management
-            use compact_str::CompactString;
-            let account_ref = std::rc::Rc::new(std::cell::RefCell::new(
-                crate::account::Account::new(CompactString::from(account), None, 0),
-            ));
-            let mut posting = Posting::new(account_ref);
+                space0,
+            )),
+            // cost
+            opt(pair(
+                delimited(space0, map(many_m_n(1, 2, char('@')), |r| r.len() == 2), space0),
+                simple_amount_field,
+            )),
+        ))),
+        opt(preceded(space0, simple_comment_field)),
+        opt(line_ending),
+    ));
 
-            if let Some((mut amount, lot_price, cost)) = amount_price_cost {
-                if let Some((calculate_price, mut price)) = lot_price {
-                    if calculate_price {
-                        price.div_amount(&amount).expect("dividing total price by qty");
-                    }
+    let (rest, (account, amount_price_cost, comment, _)) = parser(input)?;
 
-                    if amount.has_commodity() {
-                        let mut commodity =
-                            Arc::unwrap_or_clone(amount.commodity().unwrap().clone());
-                        let mut annotation = commodity.annotation().clone();
-                        annotation.set_price(price);
-                        commodity.set_annotation(annotation);
-                        amount.set_commodity(Arc::new(commodity.clone()));
-                    } else {
-                        let annotation = Annotation::with_price(price);
-                        let commodity = Commodity::with_annotation("", annotation);
-                        amount.set_commodity(Arc::new(commodity));
-                    }
-                }
+    // Create a dummy account reference for now
+    // TODO: Proper account management
+    use compact_str::CompactString;
+    let account_ref = std::rc::Rc::new(std::cell::RefCell::new(crate::account::Account::new(
+        CompactString::from(account),
+        None,
+        0,
+    )));
+    let mut posting = Posting::new(account_ref);
 
-                posting.amount = Some(amount);
-
-                if let Some((calculate_cost, mut cost)) = cost {
-                    if calculate_cost {
-                        cost.div_amount(posting.amount.as_ref().unwrap())
-                            .expect("dividing total cost by qty");
-                        posting.cost = Some(cost);
-                        posting.given_cost = None;
-                    } else {
-                        posting.cost = Some(cost.clone());
-                        posting.given_cost = Some(cost);
-                    }
-                }
+    if let Some((mut amount, lot_price, cost)) = amount_price_cost {
+        if let Some((calculate_price, mut price)) = lot_price {
+            if calculate_price {
+                price.div_amount(&amount).expect("dividing total price by qty");
             }
 
-            // TODO: confirm that amount.commodity != given_cost.commodity
-
-            if let Some(comment) = comment {
-                use compact_str::CompactString;
-                posting.note = Some(CompactString::from(comment));
+            if amount.has_commodity() {
+                let mut commodity = Arc::unwrap_or_clone(amount.commodity().unwrap().clone());
+                let mut annotation = commodity.annotation().clone();
+                annotation.set_price(price);
+                commodity.set_annotation(annotation);
+                amount.set_commodity(Arc::new(commodity.clone()));
+            } else {
+                let annotation = Annotation::with_price(price);
+                let commodity = Commodity::with_annotation("", annotation);
+                amount.set_commodity(Arc::new(commodity));
             }
+        }
 
-            posting
-        },
-    )(input)
+        posting.amount = Some(amount);
+
+        if let Some((calculate_cost, mut cost)) = cost {
+            if calculate_cost {
+                cost.div_amount(posting.amount.as_ref().unwrap())
+                    .expect("dividing total cost by qty");
+                posting.cost = Some(cost);
+                posting.given_cost = None;
+            } else {
+                posting.cost = Some(cost.clone());
+                posting.given_cost = Some(cost);
+            }
+        }
+    }
+
+    // TODO: confirm that amount.commodity != given_cost.commodity
+
+    if let Some(comment) = comment {
+        use compact_str::CompactString;
+        posting.note = Some(CompactString::from(comment));
+    }
+
+    Ok((rest, posting))
 }
 
 /// Parse an account name
@@ -1541,90 +1541,88 @@ fn quantity(input: &str) -> IResult<&str, (Decimal, Option<CommodityFlags>), Ver
     let number_without_separator_or_decimal =
         pair(map(digit1, |s: &str| (s.to_string(), None)), success(""));
 
-    map(
-        tuple((
-            opt(tag("-")),
-            space0,
-            alt((
-                number_with_separator_and_decimal(DecimalFormat::US),
-                number_with_separator_and_decimal(DecimalFormat::Euro),
-                number_with_separator_and_no_decimal(DecimalFormat::US),
-                number_with_separator_and_no_decimal(DecimalFormat::Euro),
-                number_without_separator_with_decimal(DecimalFormat::US),
-                number_without_separator_with_decimal(DecimalFormat::Euro),
-                number_without_separator_or_decimal,
-            )),
+    let mut parser = tuple((
+        opt(tag("-")),
+        space0,
+        alt((
+            number_with_separator_and_decimal(DecimalFormat::US),
+            number_with_separator_and_decimal(DecimalFormat::Euro),
+            number_with_separator_and_no_decimal(DecimalFormat::US),
+            number_with_separator_and_no_decimal(DecimalFormat::Euro),
+            number_without_separator_with_decimal(DecimalFormat::US),
+            number_without_separator_with_decimal(DecimalFormat::Euro),
+            number_without_separator_or_decimal,
         )),
-        |(maybe_sign, _, ((integer, flags), fraction))| {
-            let mut decimal_str = format!("{sign}{integer}", sign = maybe_sign.unwrap_or(""));
+    ));
 
-            if !fraction.is_empty() {
-                decimal_str.push('.');
-                decimal_str.push_str(fraction);
-            }
+    let (rest, (maybe_sign, _, ((integer, flags), fraction))) = parser(input)?;
+    let mut decimal_str = format!("{sign}{integer}", sign = maybe_sign.unwrap_or(""));
 
-            (Decimal::from_str(&decimal_str).unwrap_or_default(), flags)
-        },
-    )(input)
+    if !fraction.is_empty() {
+        decimal_str.push('.');
+        decimal_str.push_str(fraction);
+    }
+
+    Ok((rest, (Decimal::from_str(&decimal_str).unwrap_or_default(), flags)))
 }
 
 /// Parse a simple amount field, containing a quantity (number) and commodity
 /// (symbol), in any order.
 fn simple_amount_field(input: &str) -> ParseResult<'_, Amount> {
-    map(
-        alt((
-            // Commodity before quantity: GBP1, -$1000.00, €-500.50
-            // FIXME: what about -$-1?
-            map(
-                tuple((opt(terminated(char('-'), space0)), commodity_symbol, space0, quantity)),
-                |(maybe_sign, commodity, maybe_sep, (mut quantity, maybe_flags))| {
-                    if maybe_sign.is_some() {
-                        quantity.set_sign_negative(true);
-                    }
+    let mut parser = alt((
+        // Commodity before quantity: GBP1, -$1000.00, €-500.50
+        // FIXME: what about -$-1?
+        map(
+            tuple((opt(terminated(char('-'), space0)), commodity_symbol, space0, quantity)),
+            |(maybe_sign, commodity, maybe_sep, (mut quantity, maybe_flags))| {
+                if maybe_sign.is_some() {
+                    quantity.set_sign_negative(true);
+                }
 
-                    let mut flags = maybe_flags.unwrap_or(CommodityFlags::empty());
+                let mut flags = maybe_flags.unwrap_or(CommodityFlags::empty());
+                if !maybe_sep.is_empty() {
+                    flags |= CommodityFlags::STYLE_SEPARATED;
+                }
+
+                (quantity, Some(commodity), flags)
+            },
+        ),
+        // Commodity after quantity, and no commodity at all: 10.00 USD, -10.00, 1$
+        map(
+            tuple((quantity, opt(pair(space0, commodity_symbol)))),
+            |((quantity, maybe_flags), commodity)| {
+                let mut flags = maybe_flags.unwrap_or(CommodityFlags::empty());
+
+                let commodity = if let Some((maybe_sep, commodity)) = commodity {
+                    flags |= CommodityFlags::STYLE_SUFFIXED;
                     if !maybe_sep.is_empty() {
                         flags |= CommodityFlags::STYLE_SEPARATED;
                     }
+                    Some(commodity)
+                } else {
+                    None
+                };
 
-                    (quantity, Some(commodity), flags)
-                },
-            ),
-            // Commodity after quantity, and no commodity at all: 10.00 USD, -10.00, 1$
-            map(
-                tuple((quantity, opt(pair(space0, commodity_symbol)))),
-                |((quantity, maybe_flags), commodity)| {
-                    let mut flags = maybe_flags.unwrap_or(CommodityFlags::empty());
+                (quantity, commodity, flags)
+            },
+        ),
+    ));
 
-                    let commodity = if let Some((maybe_sep, commodity)) = commodity {
-                        flags |= CommodityFlags::STYLE_SUFFIXED;
-                        if !maybe_sep.is_empty() {
-                            flags |= CommodityFlags::STYLE_SEPARATED;
-                        }
-                        Some(commodity)
-                    } else {
-                        None
-                    };
+    let (rest, (quantity, commodity_symbol, commodity_flags)) = parser(input)?;
 
-                    (quantity, commodity, flags)
-                },
-            ),
-        )),
-        |(quantity, commodity_symbol, commodity_flags)| {
-            let commodity = commodity_symbol.map(|commodity_symbol| {
-                let commodity =
-                    PARSE_STATE.lock().unwrap().commodity_pool.find_or_create(&commodity_symbol);
-                let mut commodity = Arc::unwrap_or_clone(commodity);
-                // let mut commodity =
-                //     Commodity::with_precision(commodity, quantity.scale() as Precision);
-                commodity.add_flags(commodity_flags);
-                commodity.set_precision(commodity.precision().max(quantity.scale() as Precision));
+    let commodity = commodity_symbol.map(|commodity_symbol| {
+        let commodity =
+            PARSE_STATE.lock().unwrap().commodity_pool.find_or_create(&commodity_symbol);
+        let mut commodity = Arc::unwrap_or_clone(commodity);
+        // let mut commodity =
+        //     Commodity::with_precision(commodity, quantity.scale() as Precision);
+        commodity.add_flags(commodity_flags);
+        commodity.set_precision(commodity.precision().max(quantity.scale() as Precision));
 
-                PARSE_STATE.lock().unwrap().commodity_pool.insert(commodity)
-            });
-            Amount::with_commodity(quantity, commodity)
-        },
-    )(input)
+        PARSE_STATE.lock().unwrap().commodity_pool.insert(commodity)
+    });
+
+    Ok((rest, Amount::with_commodity(quantity, commodity)))
 }
 
 /// Parse a comment field with metadata extraction
