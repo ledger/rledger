@@ -599,7 +599,7 @@ pub fn null_commodity() -> CommodityRef {
 
 /// Pool for managing commodity instances and their annotations
 /// Matches the behavior of C++ commodity_pool_t
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct CommodityPool {
     /// Map of commodity symbols to commodity instances
     commodities: HashMap<String, CommodityRef>,
@@ -639,6 +639,13 @@ impl CommodityPool {
     /// Find an existing commodity by symbol
     pub fn find(&self, symbol: &str) -> Option<CommodityRef> {
         self.commodities.get(symbol).cloned()
+    }
+
+    /// Insert a commodity into the pool, overwriting any previous versions.
+    pub fn insert(&mut self, commodity: Commodity) -> CommodityRef {
+        let commodity = Arc::new(commodity);
+        self.commodities.insert(commodity.symbol().to_string(), commodity.clone());
+        commodity
     }
 
     /// Create or find an annotated commodity

@@ -419,7 +419,7 @@ impl Posting {
                 .map(|cost| {
                     let commodity =
                         cost.commodity().and_then(|c| journal_commodities.get(c.symbol()));
-                    let config = FormatConfig::from_amount(cost, &commodity);
+                    let config = FormatConfig::from_amount(cost, &commodity).reducing_precision();
                     let a = format!(" @ {}", format_amount(cost, &config));
                     a
                 })

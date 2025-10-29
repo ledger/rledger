@@ -51,6 +51,9 @@ pub struct FormatConfig {
     /// Display precision override (None uses commodity/amount precision)
     pub precision: Option<Precision>,
 
+    /// Should precision be reduced, where possible? For example, printing $1.00 as $1.
+    pub reduce_precision: bool,
+
     /// Minimum width for output
     pub min_width: Option<usize>,
 
@@ -92,6 +95,11 @@ impl FormatConfig {
 
     pub fn with_precision(mut self, precision: Precision) -> Self {
         self.precision = Some(precision);
+        self
+    }
+
+    pub fn reducing_precision(mut self) -> Self {
+        self.reduce_precision = true;
         self
     }
 
@@ -279,10 +287,19 @@ pub fn format_amount(amount: &Amount, config: &FormatConfig) -> String {
     let precision = config.precision.unwrap_or_else(|| amount.display_precision());
 
     let quantity_str = if let Some(rational) = amount.to_rational() {
-        format_rational(rational, precision, config, amount.commodity())
+        let quantity_str = format_rational(rational, precision, config, amount.commodity());
+        if config.reduce_precision {
+            dbg!(&quantity_str);
+            // quantity_str.trim_end_matches('0').trim_end_matches([',', '.']).to_string()
+            quantity_str
+        } else {
+            quantity_str
+        }
     } else {
         "0".to_string()
     };
+
+    dbg!(&quantity_str);
 
     // Add commodity formatting
     let formatted = if let Some(commodity_ref) = amount.commodity() {

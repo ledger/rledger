@@ -110,10 +110,12 @@ mod tests {
 
     use insta::assert_snapshot;
 
-    use crate::parser::JournalParser;
+    use crate::parser::{reset_parse_state, JournalParser};
 
     #[test]
     fn test_parse_and_format_journal() {
+        reset_parse_state();
+
         let input = textwrap::dedent(
             "
             1999/11/01 * Achat
@@ -143,6 +145,8 @@ mod tests {
 
     #[test]
     fn test_parse_and_format_journal_optional_year() {
+        reset_parse_state();
+
         let input = textwrap::dedent(
             "
             year 1999
@@ -159,6 +163,66 @@ mod tests {
             1999/11/01 A
                 B                                             $1
                 C
+        "#);
+    }
+
+    #[test]
+    fn test_parse_and_format_journal_with_widening_commodities() {
+        reset_parse_state();
+
+        // from test/regress/1D275740.test
+        let input = textwrap::dedent(
+            "
+            2001/12/21 Payee
+                A                                             $1
+                A                                         $1.000
+                A                                             ¢1
+                A
+            ",
+        );
+        let mut parser = JournalParser::new();
+        let journal = parser.parse_journal(&input).unwrap();
+
+        // assert_debug_snapshot!(journal.transactions, @r#""#);
+        assert_snapshot!(journal.format_transactions(), @r#"
+            2001/12/21 Payee
+                A                                         $1.000
+                A                                         $1.000
+                A                                             ¢1
+                A
+        "#);
+    }
+
+    #[test]
+    fn test_parse_and_format_journal_with_default_commodity() {
+        reset_parse_state();
+
+        // from test/regress/1D275740.test
+        let input = textwrap::dedent(
+            "
+            D 1.200,40 €
+
+            2009/08/01 Achat
+               Actif:SV                 1,0204 MFE @ 333,200 €
+               Actif:BC                           -340,00 €
+
+            2009/09/29 Vente
+               Actif:SV                 -0,0415 MFE @ 358,800 €
+               Actif:SV                      14,89 €
+            ",
+        );
+        let mut parser = JournalParser::new();
+        let journal = parser.parse_journal(&input).unwrap();
+
+        // assert_debug_snapshot!(journal.transactions, @r#""#);
+        assert_snapshot!(journal.format_transactions(), @r#"
+            2009/08/01 Achat
+                Actif:SV                              1,0204 MFE @ 333,20 €
+                Actif:BC                               -340,00 €
+
+            2009/09/29 Vente
+                Actif:SV                              -0,0415 MFE @ 358,80 €
+                Actif:SV                                 14,89 €
         "#);
     }
 }

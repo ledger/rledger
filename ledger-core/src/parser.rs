@@ -8,7 +8,7 @@
 //! - Include file resolution with cycle detection
 //! - Streaming parser for large files
 
-use ledger_math::{commodity::Precision, Annotation, CommodityFlags};
+use ledger_math::{commodity::Precision, Annotation, CommodityFlags, CommodityPool};
 use nom::{
     branch::alt,
     bytes::complete::{is_not, take_until, take_while_m_n},
@@ -107,6 +107,11 @@ fn tag<'a>(s: &'a str) -> impl Fn(&'a str) -> ParseResult<'a, &'a str> + 'a {
 static PARSE_STATE: LazyLock<Mutex<ParseContext>> =
     LazyLock::new(|| Mutex::new(ParseContext::default()));
 
+#[cfg(test)]
+pub fn reset_parse_state() {
+    PARSE_STATE.lock().unwrap().commodity_pool = CommodityPool::new();
+}
+
 /// Parser state structure for context management
 #[derive(Debug, Clone)]
 pub struct ParseContext {
@@ -124,6 +129,8 @@ pub struct ParseContext {
     pub current_year: Option<i32>,
     /// Default account for unbalanced postings
     pub default_account: Option<String>,
+    /// Commodity pool
+    pub commodity_pool: CommodityPool,
     /// Commodity aliases
     pub commodity_aliases: HashMap<String, String>,
     /// Account aliases
@@ -140,6 +147,7 @@ impl Default for ParseContext {
             apply_stack: Vec::new(),
             current_year: None,
             default_account: None,
+            commodity_pool: CommodityPool::new(),
             commodity_aliases: HashMap::new(),
             account_aliases: HashMap::new(),
         }
@@ -194,7 +202,7 @@ pub enum Directive {
         declarations: Vec<CommodityDeclaration>,
     },
     DefaultCommodity {
-        symbol: String,
+        commodity: Arc<Commodity>,
     },
 
     // Price directives
@@ -1560,53 +1568,63 @@ fn quantity(input: &str) -> IResult<&str, (Decimal, Option<CommodityFlags>), Ver
     )(input)
 }
 
-/// Parse an amount field (simplified)
+/// Parse a simple amount field, containing a quantity (number) and commodity
+/// (symbol), in any order.
 fn simple_amount_field(input: &str) -> ParseResult<'_, Amount> {
-    alt((
-        // Commodity before quantity: GBP1, -$1000.00, €-500.50
-        // FIXME: what about -$-1?
-        map(
-            tuple((opt(terminated(char('-'), space0)), commodity_symbol, space0, quantity)),
-            |(maybe_sign, commodity, maybe_sep, (mut quantity, maybe_flags))| {
-                let commodity = {
-                    let mut commodity =
-                        Commodity::with_precision(commodity, quantity.scale() as Precision);
+    map(
+        alt((
+            // Commodity before quantity: GBP1, -$1000.00, €-500.50
+            // FIXME: what about -$-1?
+            map(
+                tuple((opt(terminated(char('-'), space0)), commodity_symbol, space0, quantity)),
+                |(maybe_sign, commodity, maybe_sep, (mut quantity, maybe_flags))| {
+                    if maybe_sign.is_some() {
+                        quantity.set_sign_negative(true);
+                    }
+
+                    let mut flags = maybe_flags.unwrap_or(CommodityFlags::empty());
                     if !maybe_sep.is_empty() {
-                        commodity.add_flags(CommodityFlags::STYLE_SEPARATED);
+                        flags |= CommodityFlags::STYLE_SEPARATED;
                     }
-                    if let Some(flags) = maybe_flags {
-                        commodity.add_flags(flags);
-                    }
-                    Some(Arc::new(commodity))
-                };
 
-                if maybe_sign.is_some() {
-                    quantity.set_sign_negative(true);
-                }
+                    (quantity, Some(commodity), flags)
+                },
+            ),
+            // Commodity after quantity, and no commodity at all: 10.00 USD, -10.00, 1$
+            map(
+                tuple((quantity, opt(pair(space0, commodity_symbol)))),
+                |((quantity, maybe_flags), commodity)| {
+                    let mut flags = maybe_flags.unwrap_or(CommodityFlags::empty());
 
-                Amount::with_commodity(quantity, commodity)
-            },
-        ),
-        // Commodity after quantity, and no commodity at all: 10.00 USD, -10.00, 1$
-        map(
-            tuple((quantity, opt(pair(space0, commodity_symbol)))),
-            |((quantity, maybe_flags), commodity)| {
-                let commodity = commodity.map(|(sep, commodity)| {
-                    let mut commodity =
-                        Commodity::with_precision(commodity, quantity.scale() as Precision);
-                    commodity.add_flags(CommodityFlags::STYLE_SUFFIXED);
-                    if !sep.is_empty() {
-                        commodity.add_flags(CommodityFlags::STYLE_SEPARATED);
-                    }
-                    if let Some(flags) = maybe_flags {
-                        commodity.add_flags(flags);
-                    }
-                    Arc::new(commodity)
-                });
-                Amount::with_commodity(quantity, commodity)
-            },
-        ),
-    ))(input)
+                    let commodity = if let Some((maybe_sep, commodity)) = commodity {
+                        flags |= CommodityFlags::STYLE_SUFFIXED;
+                        if !maybe_sep.is_empty() {
+                            flags |= CommodityFlags::STYLE_SEPARATED;
+                        }
+                        Some(commodity)
+                    } else {
+                        None
+                    };
+
+                    (quantity, commodity, flags)
+                },
+            ),
+        )),
+        |(quantity, commodity_symbol, commodity_flags)| {
+            let commodity = commodity_symbol.map(|commodity_symbol| {
+                let commodity =
+                    PARSE_STATE.lock().unwrap().commodity_pool.find_or_create(&commodity_symbol);
+                let mut commodity = Arc::unwrap_or_clone(commodity);
+                // let mut commodity =
+                //     Commodity::with_precision(commodity, quantity.scale() as Precision);
+                commodity.add_flags(commodity_flags);
+                commodity.set_precision(commodity.precision().max(quantity.scale() as Precision));
+
+                PARSE_STATE.lock().unwrap().commodity_pool.insert(commodity)
+            });
+            Amount::with_commodity(quantity, commodity)
+        },
+    )(input)
 }
 
 /// Parse a comment field with metadata extraction
@@ -1666,6 +1684,9 @@ fn process_directive_inline(directive: Directive) -> Directive {
         Directive::Year { year } => {
             PARSE_STATE.lock().unwrap().current_year = Some(year);
         }
+        Directive::DefaultCommodity { ref commodity } => {
+            PARSE_STATE.lock().unwrap().commodity_pool.set_default_commodity(commodity.clone());
+        }
 
         // no inline processing for these directives
         Directive::Account { .. }
@@ -1675,7 +1696,6 @@ fn process_directive_inline(directive: Directive) -> Directive {
         | Directive::Assert { .. }
         | Directive::Check { .. }
         | Directive::Commodity { .. }
-        | Directive::DefaultCommodity { .. }
         | Directive::Price { .. }
         | Directive::Include { .. }
         | Directive::ConditionalInclude { .. }
@@ -1888,9 +1908,13 @@ fn year_directive(input: &str) -> ParseResult<'_, Directive> {
 
 /// Parse default commodity directive
 fn default_commodity_directive(input: &str) -> ParseResult<'_, Directive> {
-    map(preceded(tag("D"), preceded(space1, take_until("\n"))), |symbol: &str| {
-        Directive::DefaultCommodity { symbol: symbol.trim().to_string() }
-    })(input)
+    map(
+        preceded(
+            pair(tag("D"), space1),
+            verify(simple_amount_field, |amount| amount.commodity().is_some()),
+        ),
+        |amount| Directive::DefaultCommodity { commodity: amount.commodity().unwrap().clone() },
+    )(input)
 }
 
 /// Parse assert directive
@@ -2172,6 +2196,21 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_default_commodity() {
+        let (_, commodity) = default_commodity_directive("D 1.00 $").unwrap();
+
+        let Directive::DefaultCommodity { commodity } = commodity else {
+            panic!("did not parse `D` (default commodity) directive");
+        };
+
+        assert_eq!("$", commodity.symbol());
+        assert_eq!(
+            CommodityFlags::STYLE_SUFFIXED | CommodityFlags::STYLE_SEPARATED,
+            commodity.flags()
+        );
+    }
+
+    #[test]
     fn test_parse_commodity() {
         let (_, commodity) = commodity_symbol("USD").unwrap();
         assert_eq!("USD", commodity);
@@ -2267,120 +2306,206 @@ mod tests {
 
     #[test]
     fn test_parse_amount() {
-        let (_, amount) = simple_amount_field("1").unwrap();
-        insta::assert_debug_snapshot!(amount, @r#"
-            AMOUNT(1) [prec:0, keep:false, raw:1]
-        "#);
+        {
+            reset_parse_state();
+            let (_, amount) = simple_amount_field("1").unwrap();
+            insta::assert_debug_snapshot!(amount, @r#"
+                AMOUNT(1) [prec:0, keep:false, raw:1]
+            "#);
+        }
 
-        let (_, amount) = simple_amount_field("-1").unwrap();
-        insta::assert_debug_snapshot!(amount, @r#"
-            AMOUNT(-1) [prec:0, keep:false, raw:-1]
-        "#);
+        {
+            reset_parse_state();
+            let (_, amount) = simple_amount_field("-1").unwrap();
+            insta::assert_debug_snapshot!(amount, @r#"
+                AMOUNT(-1) [prec:0, keep:false, raw:-1]
+            "#);
+        }
 
-        let (_, amount) = simple_amount_field("$1").unwrap();
-        insta::assert_debug_snapshot!(amount, @r#"
-            AMOUNT($1) [prec:0, keep:false, comm:$, raw:1]
-        "#);
-        assert_eq!(CommodityFlags::empty(), amount.commodity().unwrap().flags());
+        {
+            reset_parse_state();
+            let (_, amount) = simple_amount_field("$1").unwrap();
+            insta::assert_debug_snapshot!(amount, @r#"
+                AMOUNT($1) [prec:0, keep:false, comm:$, raw:1]
+            "#);
+            assert_eq!(CommodityFlags::empty(), amount.commodity().unwrap().flags());
+        }
 
-        let (_, amount) = simple_amount_field("1$").unwrap();
-        insta::assert_debug_snapshot!(amount, @r#"
-            AMOUNT(1$) [prec:0, keep:false, comm:$, raw:1]
-        "#);
-        assert_eq!(CommodityFlags::STYLE_SUFFIXED, amount.commodity().unwrap().flags());
+        {
+            reset_parse_state();
+            let (_, amount) = simple_amount_field("1$").unwrap();
+            insta::assert_debug_snapshot!(amount, @r#"
+                AMOUNT(1$) [prec:0, keep:false, comm:$, raw:1]
+            "#);
+            assert_eq!(CommodityFlags::STYLE_SUFFIXED, amount.commodity().unwrap().flags());
+        }
 
-        let (_, amount) = simple_amount_field("-$1").unwrap();
-        insta::assert_debug_snapshot!(amount, @r#"
-            AMOUNT($-1) [prec:0, keep:false, comm:$, raw:-1]
-        "#);
-        assert_eq!(CommodityFlags::empty(), amount.commodity().unwrap().flags());
+        {
+            reset_parse_state();
+            let (_, amount) = simple_amount_field("-$1").unwrap();
+            insta::assert_debug_snapshot!(amount, @r#"
+                AMOUNT($-1) [prec:0, keep:false, comm:$, raw:-1]
+            "#);
+            assert_eq!(CommodityFlags::empty(), amount.commodity().unwrap().flags());
+        }
 
-        let (_, amount) = simple_amount_field("$-1").unwrap();
-        insta::assert_debug_snapshot!(amount, @r#"
-            AMOUNT($-1) [prec:0, keep:false, comm:$, raw:-1]
-        "#);
-        assert_eq!(CommodityFlags::empty(), amount.commodity().unwrap().flags());
+        {
+            reset_parse_state();
+            let (_, amount) = simple_amount_field("$-1").unwrap();
+            insta::assert_debug_snapshot!(amount, @r#"
+                AMOUNT($-1) [prec:0, keep:false, comm:$, raw:-1]
+            "#);
+            assert_eq!(CommodityFlags::empty(), amount.commodity().unwrap().flags());
+        }
 
-        let (_, amount) = simple_amount_field("$- 1").unwrap();
-        insta::assert_debug_snapshot!(amount, @r#"
-            AMOUNT($-1) [prec:0, keep:false, comm:$, raw:-1]
-        "#);
-        assert_eq!(CommodityFlags::empty(), amount.commodity().unwrap().flags());
+        {
+            reset_parse_state();
+            let (_, amount) = simple_amount_field("$- 1").unwrap();
+            insta::assert_debug_snapshot!(amount, @r#"
+                AMOUNT($-1) [prec:0, keep:false, comm:$, raw:-1]
+            "#);
+            assert_eq!(CommodityFlags::empty(), amount.commodity().unwrap().flags());
+        }
 
-        let (_, amount) = simple_amount_field("$ -1").unwrap();
-        insta::assert_debug_snapshot!(amount, @r#"
-            AMOUNT($ -1) [prec:0, keep:false, comm:$, raw:-1]
-        "#);
-        assert_eq!(CommodityFlags::STYLE_SEPARATED, amount.commodity().unwrap().flags());
+        {
+            reset_parse_state();
+            let (_, amount) = simple_amount_field("$ -1").unwrap();
+            insta::assert_debug_snapshot!(amount, @r#"
+                AMOUNT($ -1) [prec:0, keep:false, comm:$, raw:-1]
+            "#);
+            assert_eq!(CommodityFlags::STYLE_SEPARATED, amount.commodity().unwrap().flags());
+        }
 
-        let (_, amount) = simple_amount_field("$ 1").unwrap();
-        insta::assert_debug_snapshot!(amount, @r#"
-            AMOUNT($ 1) [prec:0, keep:false, comm:$, raw:1]
-        "#);
-        assert_eq!(CommodityFlags::STYLE_SEPARATED, amount.commodity().unwrap().flags());
+        {
+            reset_parse_state();
+            let (_, amount) = simple_amount_field("$ 1").unwrap();
+            insta::assert_debug_snapshot!(amount, @r#"
+                AMOUNT($ 1) [prec:0, keep:false, comm:$, raw:1]
+            "#);
+            assert_eq!(CommodityFlags::STYLE_SEPARATED, amount.commodity().unwrap().flags());
+        }
 
-        let (_, amount) = simple_amount_field("1 USD").unwrap();
-        insta::assert_debug_snapshot!(amount, @r#"
-            AMOUNT(1 USD) [prec:0, keep:false, comm:USD, raw:1]
-        "#);
-        assert_eq!(
-            CommodityFlags::STYLE_SEPARATED | CommodityFlags::STYLE_SUFFIXED,
-            amount.commodity().unwrap().flags()
-        );
+        {
+            reset_parse_state();
+            let (_, amount) = simple_amount_field("1 USD").unwrap();
+            insta::assert_debug_snapshot!(amount, @r#"
+                AMOUNT(1 USD) [prec:0, keep:false, comm:USD, raw:1]
+            "#);
+            assert_eq!(
+                CommodityFlags::STYLE_SEPARATED | CommodityFlags::STYLE_SUFFIXED,
+                amount.commodity().unwrap().flags()
+            );
+        }
 
-        let (_, amount) = simple_amount_field("1USD").unwrap();
-        insta::assert_debug_snapshot!(amount, @r#"
-            AMOUNT(1USD) [prec:0, keep:false, comm:USD, raw:1]
-        "#);
-        assert_eq!(CommodityFlags::STYLE_SUFFIXED, amount.commodity().unwrap().flags());
+        {
+            reset_parse_state();
+            let (_, amount) = simple_amount_field("1USD").unwrap();
+            insta::assert_debug_snapshot!(amount, @r#"
+                AMOUNT(1USD) [prec:0, keep:false, comm:USD, raw:1]
+            "#);
+            assert_eq!(CommodityFlags::STYLE_SUFFIXED, amount.commodity().unwrap().flags());
+        }
 
-        let (_, amount) = simple_amount_field(r#"1000 "M&M""#).unwrap();
-        insta::assert_debug_snapshot!(amount, @r#"
-            AMOUNT(1000 "M&M") [prec:0, keep:false, comm:"M&M", raw:1000]
-        "#);
-        assert_eq!(
-            CommodityFlags::STYLE_SEPARATED | CommodityFlags::STYLE_SUFFIXED,
-            amount.commodity().unwrap().flags()
-        );
+        {
+            reset_parse_state();
+            let (_, amount) = simple_amount_field(r#"1000 "M&M""#).unwrap();
+            insta::assert_debug_snapshot!(amount, @r#"
+                AMOUNT(1000 "M&M") [prec:0, keep:false, comm:"M&M", raw:1000]
+            "#);
+            assert_eq!(
+                CommodityFlags::STYLE_SEPARATED | CommodityFlags::STYLE_SUFFIXED,
+                amount.commodity().unwrap().flags()
+            );
+        }
 
-        let (rem, amount) = simple_amount_field("-188,7974 STK @ 14,200 $").unwrap();
-        assert_eq!(rem, " @ 14,200 $");
-        insta::assert_debug_snapshot!(amount, @r#"
-            AMOUNT(-188.7974 STK) [prec:4, keep:false, comm:STK, raw:-943987/5000]
-        "#);
-        assert_eq!(
-            CommodityFlags::STYLE_SUFFIXED
-                | CommodityFlags::STYLE_SEPARATED
-                | CommodityFlags::STYLE_DECIMAL_COMMA,
-            amount.commodity().unwrap().flags()
-        );
+        {
+            reset_parse_state();
+            let (_, amount) = simple_amount_field("-1672,42 $").unwrap();
+            insta::assert_debug_snapshot!(amount, @r#"
+                AMOUNT(-1672.42 $) [prec:2, keep:false, comm:$, raw:-83621/50]
+            "#);
+            assert_eq!(
+                CommodityFlags::STYLE_SEPARATED
+                    | CommodityFlags::STYLE_SUFFIXED
+                    | CommodityFlags::STYLE_DECIMAL_COMMA,
+                amount.commodity().unwrap().flags()
+            );
+        }
+
+        // FIXME: this parses as 358,800.00 (US) but it should be 358.800 (Euro)
+        {
+            reset_parse_state();
+
+            let mut commodity = Commodity::new("€");
+            commodity.add_flags(CommodityFlags::STYLE_DECIMAL_COMMA);
+            PARSE_STATE.lock().unwrap().commodity_pool.insert(commodity);
+
+            let (_, amount) = simple_amount_field("358,800 €").unwrap();
+            insta::assert_debug_snapshot!(amount, @r#"
+                AMOUNT(358.800 €) [prec:3, keep:false, comm:€, raw:358.800]
+            "#);
+            assert_eq!(3, amount.commodity().unwrap().precision());
+            assert_eq!(
+                CommodityFlags::STYLE_SUFFIXED
+                    | CommodityFlags::STYLE_SEPARATED
+                    | CommodityFlags::STYLE_DECIMAL_COMMA,
+                amount.commodity().unwrap().flags()
+            );
+
+            let commodity = PARSE_STATE.lock().unwrap().commodity_pool.find("€").unwrap();
+            // STYLE_SUFFIXED is added to the commodity, but STYLE_SEPARATED is not
+            assert_eq!(
+                CommodityFlags::STYLE_SUFFIXED | CommodityFlags::STYLE_DECIMAL_COMMA,
+                commodity.flags()
+            );
+        }
+
+        {
+            reset_parse_state();
+            let (rem, amount) = simple_amount_field("-188,7974 STK @ 14,200 $").unwrap();
+            assert_eq!(rem, " @ 14,200 $");
+            insta::assert_debug_snapshot!(amount, @r#"
+                AMOUNT(-188.7974 STK) [prec:4, keep:false, comm:STK, raw:-943987/5000]
+            "#);
+            assert_eq!(
+                CommodityFlags::STYLE_SUFFIXED
+                    | CommodityFlags::STYLE_SEPARATED
+                    | CommodityFlags::STYLE_DECIMAL_COMMA,
+                amount.commodity().unwrap().flags()
+            );
+        }
     }
 
     #[test]
     fn test_parse_posting() {
+        reset_parse_state();
         let (_, posting) = parse_posting("A  $12").unwrap();
         assert_eq!(posting.account_name(), "A".to_string());
         insta::assert_debug_snapshot!(posting.amount.unwrap(), @r#"
             AMOUNT($12) [prec:0, keep:false, comm:$, raw:12]
         "#);
 
+        reset_parse_state();
         let (_, posting) = parse_posting("A\t$12").unwrap();
         assert_eq!(posting.account_name(), "A".to_string());
         insta::assert_debug_snapshot!(posting.amount.unwrap(), @r#"
             AMOUNT($12) [prec:0, keep:false, comm:$, raw:12]
         "#);
 
+        reset_parse_state();
         // not enough spaces between account and price
         let (_, posting) = parse_posting("A $12").unwrap();
         assert_eq!(posting.account_name(), "A $12".to_string());
         assert!(posting.amount.is_none());
 
+        reset_parse_state();
         let (_, posting) = parse_posting("A  12 USD").unwrap();
         assert_eq!(posting.account_name(), "A".to_string());
         insta::assert_debug_snapshot!(posting.amount.unwrap(), @r#"
             AMOUNT(12 USD) [prec:0, keep:false, comm:USD, raw:12]
         "#);
 
+        reset_parse_state();
         let (_, posting) = parse_posting("A  3 @ $4").unwrap();
         insta::assert_debug_snapshot!(posting.amount.unwrap(), @r#"
             AMOUNT(3) [prec:0, keep:false, raw:3]
@@ -2392,6 +2517,7 @@ mod tests {
         "#);
         assert_eq!(posting.cost, posting.given_cost);
 
+        reset_parse_state();
         let (_, posting) = parse_posting("A  6@@$12").unwrap();
         insta::assert_debug_snapshot!(posting.amount.unwrap(), @r#"
             AMOUNT(6) [prec:0, keep:false, raw:6]
@@ -2409,6 +2535,7 @@ mod tests {
         // TODO: qty and cost different commodities, but only if price not included
         // TODO: virtual cost
 
+        reset_parse_state();
         let (_, posting) = parse_posting("A  3 {$2} @ $4").unwrap();
         insta::assert_debug_snapshot!(posting.amount.as_ref().unwrap(), @r#"
             AMOUNT(3) [prec:0, keep:false, comm:, raw:3]
@@ -2424,6 +2551,7 @@ mod tests {
             )
         "#);
 
+        reset_parse_state();
         let (_, posting) = parse_posting("A  $1.20 {{£5.00}} @@6.00£").unwrap();
         // AMOUNT($1.20) [prec:2, keep:false, comm:$, raw:1.20]
         // amount, as given
@@ -2443,6 +2571,7 @@ mod tests {
             )
         "#);
 
+        reset_parse_state();
         let (_, posting) = parse_posting("Actif:SV  -0,0415 MFE @ 358,80 €").unwrap();
         insta::assert_debug_snapshot!(posting.amount.as_ref().unwrap(), @r#"
             AMOUNT(-0.0415 MFE) [prec:4, keep:false, comm:MFE, raw:-83/2000]
