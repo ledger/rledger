@@ -289,7 +289,7 @@ pub fn format_amount(amount: &Amount, config: &FormatConfig) -> String {
     let quantity_str = if let Some(rational) = amount.to_rational() {
         let quantity_str = format_rational(rational, precision, config, amount.commodity());
         if config.reduce_precision {
-            dbg!(&quantity_str);
+            // dbg!(&quantity_str);
             // quantity_str.trim_end_matches('0').trim_end_matches([',', '.']).to_string()
             quantity_str
         } else {
@@ -299,7 +299,7 @@ pub fn format_amount(amount: &Amount, config: &FormatConfig) -> String {
         "0".to_string()
     };
 
-    dbg!(&quantity_str);
+    // dbg!(&quantity_str);
 
     // Add commodity formatting
     let formatted = if let Some(commodity_ref) = amount.commodity() {

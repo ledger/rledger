@@ -439,6 +439,8 @@ impl Transaction {
         writer: &mut impl std::io::Write,
         journal_commodities: &HashMap<String, Arc<Commodity>>,
     ) -> Result<(), std::io::Error> {
+        // dbg!(journal_commodities);
+
         let status = match self.status {
             TransactionStatus::Uncleared => "",
             TransactionStatus::Cleared => " *",

@@ -38,7 +38,7 @@ fn main() -> anyhow::Result<()> {
             println!("-----------");
             println!("Transactions: {}", journal.transactions.len());
             println!("Accounts: {}", journal.accounts.len());
-            println!("Commodities: {}", journal.commodities.len());
+            println!("Commodities: {}", journal.commodity_pool.commodity_count());
 
             // Show sample transactions
             if !journal.transactions.is_empty() {
@@ -84,13 +84,13 @@ fn main() -> anyhow::Result<()> {
             }
 
             // Show commodities
-            if !journal.commodities.is_empty() {
+            if !journal.commodity_pool.commodity_map().is_empty() {
                 println!();
                 println!("Commodities found:");
                 println!("------------------");
 
-                for commodity in journal.commodities.values() {
-                    println!("- {}", commodity.symbol());
+                for commodity in journal.commodity_pool.commodity_map().keys() {
+                    println!("- {}", commodity);
                 }
             }
         }

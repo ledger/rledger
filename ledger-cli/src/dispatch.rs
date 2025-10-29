@@ -12,11 +12,9 @@ use clap::CommandFactory;
 use ledger_core::journal::Journal;
 use ledger_core::parser::JournalParser;
 use ledger_core::posting::Posting;
-use ledger_math::Commodity;
 use regex::Regex;
 use std::collections::HashSet;
 use std::io::{self, Write};
-use std::sync::Arc;
 
 /// Main command dispatcher
 pub struct Dispatcher {
@@ -311,7 +309,7 @@ impl Dispatcher {
             }
         };
 
-        let mut commodities: Vec<&Arc<Commodity>> = if !args.pattern.is_empty() {
+        let mut commodities: Vec<String> = if !args.pattern.is_empty() {
             let pattern = {
                 let pattern = args.pattern.join("*.|.*");
                 let pattern = format!(".*(?i:{pattern}).*");
@@ -324,7 +322,10 @@ impl Dispatcher {
                 .flat_map(|t| {
                     t.postings.iter().filter_map(|p: &Posting| {
                         if p.account.borrow_mut().matches_pattern(&pattern) {
-                            p.amount.as_ref().and_then(|a| a.commodity())
+                            p.amount
+                                .as_ref()
+                                .and_then(|a| a.commodity())
+                                .map(|c| c.symbol().to_string())
                         } else {
                             None
                         }
@@ -334,10 +335,10 @@ impl Dispatcher {
 
             commodities.into_iter().collect()
         } else {
-            journal.commodities.values().collect()
+            journal.commodity_pool.commodity_map().keys().cloned().collect()
         };
 
-        commodities.sort_by_key(|a| a.symbol());
+        commodities.sort();
         for commodity in commodities {
             println!("{commodity}");
         }

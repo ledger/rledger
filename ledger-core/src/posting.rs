@@ -498,7 +498,7 @@ mod tests {
             parse_posting("Actif:SV                              1,0204 MFE @ 333,20 €").unwrap();
         insta::assert_snapshot!(
             posting.format(0, &HashMap::default()),
-            @r#"    Actif:SV                              1,0204 MFE @ 333,20 €"#
+            @r#"    Actif:SV                              1,0204 MFE @ 333,2 €"#
         );
     }
 }

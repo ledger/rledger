@@ -1028,7 +1028,7 @@ impl ReportGenerator for PrintReport {
             }
 
             transaction
-                .write(writer, &self.journal.commodities)
+                .write(writer, self.journal.commodity_pool.commodity_map())
                 .map_err(|e| ReportError::IoError(e.to_string()))?;
         }
 

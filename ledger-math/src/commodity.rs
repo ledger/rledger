@@ -648,6 +648,23 @@ impl CommodityPool {
         commodity
     }
 
+    /// Update a commodity into the pool, inserting it if it's not yet in the pool.
+    pub fn update(&mut self, commodity: Commodity) -> CommodityRef {
+        let commodity = Arc::new(commodity);
+        self.commodities.insert(commodity.symbol().to_string(), commodity.clone());
+        commodity
+    }
+
+    /// Insert a ref commodity into the pool, overwriting any previous versions.
+    pub fn insert_ref(&mut self, commodity: &CommodityRef) {
+        self.commodities.entry(commodity.symbol().to_string()).or_insert(commodity.clone());
+    }
+
+    /// Insert a commodity into the pool, overwriting any previous versions.
+    pub fn has_commodity(&mut self, symbol: &str) -> bool {
+        self.commodities.contains_key(symbol)
+    }
+
     /// Create or find an annotated commodity
     pub fn find_or_create_annotated(
         &mut self,
@@ -674,6 +691,11 @@ impl CommodityPool {
     ) -> Option<Arc<AnnotatedCommodity>> {
         let key = (symbol.to_string(), annotation.clone());
         self.annotated_commodities.get(&key).cloned()
+    }
+
+    /// Get all commodities in the pool
+    pub fn commodity_map(&self) -> &HashMap<String, CommodityRef> {
+        &self.commodities
     }
 
     /// Get all commodities in the pool
