@@ -6,6 +6,7 @@ use ledger_math::{format_amount, Commodity, FormatConfig, FormatFlags};
 use smallvec::SmallVec;
 use std::collections::HashMap;
 use std::sync::Arc;
+use unicode_width::UnicodeWidthStr;
 
 use crate::account::AccountRef;
 use crate::strings::{AccountName, PayeeName};
@@ -396,10 +397,6 @@ impl Posting {
             PostingStatus::Pending => " !",
         };
 
-        // align status + account name to 36 chars + 2 for the account/amount separator
-        let account_width =
-            max_account_width.max(36).max(account_name.len()).saturating_sub(status.len()) + 2;
-
         if let Some(amount) = &self.amount {
             let price = amount
                 .commodity()
@@ -425,7 +422,7 @@ impl Posting {
                 })
                 .unwrap_or_default();
 
-            let default_amount_width = 10;
+            let default_amount_width = 12;
             let amount = {
                 let commodity =
                     amount.commodity().and_then(|c| journal_commodities.get(c.symbol()));
@@ -435,18 +432,27 @@ impl Posting {
                     .with_flags(FormatFlags::RIGHT_JUSTIFY)
                     .with_precision(precision)
                     .with_width(default_amount_width, None);
-                format_amount(amount, &config) + price.as_str() + cost.as_str()
+                format_amount(amount, &config)
             };
 
-            // FIXME: what is this +2 about?
-            if amount.len() > (default_amount_width + 2) {
-                write!(writer, "    {status}{account_name:account_width$}{amount}")?
+            // align status + account name to 36 cols
+            let account_width =
+                max_account_width.max(36).max(account_name.width()).saturating_sub(status.width());
+            let account_slip = account_width.saturating_sub(account_name.width() + status.width());
+
+            // amount is already right aligned to 12 cols
+            let amount_slip = amount.width() - amount.trim().width();
+
+            let separator = if account_slip + amount_slip < 2 {
+                " ".repeat(account_slip + amount_slip)
             } else {
-                write!(
-                    writer,
-                    "    {status}{account_name:account_width$}{amount:>default_amount_width$}",
-                )?
-            }
+                String::new()
+            };
+
+            write!(
+                writer,
+                "    {status}{account_name:account_width$}{separator}{amount}{price}{cost}"
+            )?
         } else {
             write!(writer, "    {status}{account_name}")?
         }
@@ -484,11 +490,10 @@ mod tests {
 
     #[test]
     fn test_parse_and_format_posting_with_extra_precision() {
-        let (_, posting) =
-            parse_posting("Actif:SSB                           125,0000 STK").unwrap();
+        let (_, posting) = parse_posting("Actif:SSB                       125,0000   STK").unwrap();
         insta::assert_snapshot!(
             posting.format(0, &HashMap::default()),
-            @r#"    Actif:SSB                             125,0000 STK"#
+            @r#"    Actif:SSB                           125,0000 STK"#
         );
     }
 

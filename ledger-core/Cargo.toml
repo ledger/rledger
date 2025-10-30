@@ -30,6 +30,7 @@ fnv = "1.0"
 lru = "0.12"
 moka = { version = "0.12", features = ["sync"] }
 log = "0.4"
+unicode-width = { workspace = true }
 
 # Performance optimization dependencies
 smallvec = { workspace = true }

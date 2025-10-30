@@ -9,6 +9,7 @@ use std::sync::Arc;
 use num_bigint::BigInt;
 use num_rational::BigRational;
 use num_traits::{Signed, Zero};
+use unicode_width::UnicodeWidthStr;
 
 use crate::amount::{Amount, Precision};
 use crate::balance::Balance;
@@ -250,7 +251,7 @@ pub fn apply_width_formatting(text: &str, config: &FormatConfig) -> String {
 
     // First truncate if max_width is specified
     let mut result = if let Some(max_w) = max_width {
-        if text.len() > max_w {
+        if text.width() > max_w {
             if max_w > 3 {
                 format!("{}...", &text[..max_w - 3])
             } else if max_w > 0 {
@@ -266,8 +267,8 @@ pub fn apply_width_formatting(text: &str, config: &FormatConfig) -> String {
     };
 
     // Then apply minimum width padding
-    if result.len() < min_width {
-        let padding = min_width - result.len();
+    if result.width() < min_width {
+        let padding = min_width - result.width();
         if config.flags.has_flag(FormatFlags::RIGHT_JUSTIFY) {
             result = format!("{}{}", " ".repeat(padding), result);
         } else {

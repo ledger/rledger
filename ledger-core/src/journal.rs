@@ -227,7 +227,7 @@ mod tests {
                 Actif:BC                               -340,00 €
 
             2009/09/29 Vente
-                Actif:SV                              -0,0415 MFE @ 358,80 €
+                Actif:SV                             -0,0415 MFE @ 358,80 €
                 Actif:SV                                 14,89 €
         "#);
     }

@@ -1176,6 +1176,7 @@ dependencies = [
  "tempfile",
  "textwrap",
  "thiserror",
+ "unicode-width",
 ]
 
 [[package]]
@@ -1194,6 +1195,7 @@ dependencies = [
  "rust_decimal",
  "serde",
  "thiserror",
+ "unicode-width",
 ]
 
 [[package]]
