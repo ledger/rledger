@@ -23,6 +23,7 @@ use nom::{
 
 // We need to use bytes for tag with byte strings
 
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::{BufRead, BufReader};
@@ -30,10 +31,6 @@ use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::str::FromStr;
 use std::sync::Arc;
-use std::{
-    cell::RefCell,
-    sync::{LazyLock, Mutex},
-};
 
 use crate::{
     account::Account,
@@ -103,16 +100,16 @@ fn tag<'a>(s: &'a str) -> impl Fn(&'a str) -> ParseResult<'a, &'a str> + 'a {
     }
 }
 
-/// Global parse state.
-// FIXME: reset this for each test
-// FIXME: this is not thread-stable between tests; eg `cargo test --jobs 1` may
-// work but others may not
-static PARSE_STATE: LazyLock<Mutex<ParseContext>> =
-    LazyLock::new(|| Mutex::new(ParseContext::default()));
+// thread_local! allows shared global state during parse while still allowing us
+// to run tests in parallel. Won't work if parsing is ever multithreaded.
+thread_local! {
+    /// Global parse state.
+    static PARSE_STATE: RefCell<ParseContext> = RefCell::new(ParseContext::default())
+}
 
 #[cfg(test)]
 pub fn reset_parse_state() {
-    PARSE_STATE.lock().unwrap().commodity_pool = CommodityPool::new();
+    PARSE_STATE.with_borrow_mut(|c| c.commodity_pool = CommodityPool::new());
 }
 
 /// Parser state structure for context management
@@ -347,9 +344,9 @@ impl JournalParser {
     /// Parse a complete journal from a string
     pub fn parse_journal(&mut self, input: &str) -> Result<Journal, JournalParseError> {
         let entries = {
-            PARSE_STATE.lock().unwrap().commodity_pool = self.context.commodity_pool.clone();
+            PARSE_STATE.with_borrow_mut(|c| c.commodity_pool = self.context.commodity_pool.clone());
             let entries = self.parse_entries(input)?;
-            self.context.commodity_pool = PARSE_STATE.lock().unwrap().commodity_pool.clone();
+            self.context.commodity_pool = PARSE_STATE.with_borrow_mut(|c| c.commodity_pool.clone());
             entries
         };
         let journal = self.build_journal(entries)?;
@@ -1312,8 +1309,8 @@ fn date_field(input: &str) -> ParseResult<'_, NaiveDate> {
             date_with_optional_year("."),
         )),
         |(year, month, day)| {
-            let default_year =
-                PARSE_STATE.lock().unwrap().current_year.unwrap_or_else(|| Local::now().year());
+            let default_year = PARSE_STATE
+                .with_borrow_mut(|c| c.current_year.unwrap_or_else(|| Local::now().year()));
 
             let year = if let Some(year) = year {
                 year.parse::<i32>().unwrap_or(default_year)
@@ -1760,7 +1757,7 @@ fn amount_field_impl(input: &str, options: AmountFieldOptions) -> ParseResult<'_
 
     let commodity = if let Some(commodity_symbol) = commodity_symbol {
         let commodity =
-            PARSE_STATE.lock().unwrap().commodity_pool.find_or_create(&commodity_symbol);
+            PARSE_STATE.with_borrow_mut(|c| c.commodity_pool.find_or_create(&commodity_symbol));
         if ["€", "$"].contains(&commodity.symbol()) {
             debug!(
                 "existing cmdty: {} {} {:#?}",
@@ -1857,7 +1854,7 @@ fn amount_field_impl(input: &str, options: AmountFieldOptions) -> ParseResult<'_
                     commodity.flags()
                 );
             }
-            PARSE_STATE.lock().unwrap().commodity_pool.insert(commodity)
+            PARSE_STATE.with_borrow_mut(|c| c.commodity_pool.insert(commodity))
         } else {
             commodity
         };
@@ -1928,10 +1925,11 @@ fn parse_directive(input: &str) -> ParseResult<'_, Directive> {
 fn process_directive_inline(directive: Directive) -> Directive {
     match directive {
         Directive::Year { year } => {
-            PARSE_STATE.lock().unwrap().current_year = Some(year);
+            PARSE_STATE.with_borrow_mut(|c| c.current_year = Some(year));
         }
         Directive::DefaultCommodity { ref commodity } => {
-            PARSE_STATE.lock().unwrap().commodity_pool.set_default_commodity(commodity.clone());
+            PARSE_STATE
+                .with_borrow_mut(|c| c.commodity_pool.set_default_commodity(commodity.clone()));
         }
 
         // no inline processing for these directives
@@ -2419,7 +2417,7 @@ mod tests {
         // let (_, date) = date_field("2023-01/02").unwrap();
 
         // year optional
-        PARSE_STATE.lock().unwrap().current_year = Some(1999);
+        PARSE_STATE.with_borrow_mut(|c| c.current_year = Some(1999));
         let (_, date) = date_field("02/03").unwrap();
         assert_eq!(1999, date.year());
         assert_eq!(2, date.month());
@@ -2430,7 +2428,7 @@ mod tests {
         assert_eq!(date, date2);
 
         // 1 digit day & month
-        PARSE_STATE.lock().unwrap().current_year = Some(2005);
+        PARSE_STATE.with_borrow_mut(|c| c.current_year = Some(2005));
         let (_, date) = date_field("4/5").unwrap();
         assert_eq!(2005, date.year());
         assert_eq!(4, date.month());
@@ -2792,7 +2790,7 @@ mod tests {
 
             let mut commodity = Commodity::new("€");
             commodity.add_flags(CommodityFlags::STYLE_DECIMAL_COMMA);
-            PARSE_STATE.lock().unwrap().commodity_pool.insert(commodity);
+            PARSE_STATE.with_borrow_mut(|c| c.commodity_pool.insert(commodity));
 
             let (_, amount) = simple_amount_field("358,800 €").unwrap();
             insta::assert_debug_snapshot!(amount, @r#"
@@ -2807,7 +2805,7 @@ mod tests {
             );
 
             // commodity pool is also updated
-            let commodity = PARSE_STATE.lock().unwrap().commodity_pool.find("€").unwrap();
+            let commodity = PARSE_STATE.with_borrow_mut(|c| c.commodity_pool.find("€").unwrap());
             assert_eq!(
                 CommodityFlags::STYLE_SUFFIXED
                     | CommodityFlags::STYLE_SEPARATED
