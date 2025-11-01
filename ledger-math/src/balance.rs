@@ -329,7 +329,7 @@ impl Balance {
 
     /// Print this balance to a stream with formatting options
     pub fn print<W: fmt::Write>(&self, writer: &mut W, config: &FormatConfig) -> fmt::Result {
-        write!(writer, "{}", format_balance(self, &config))
+        write!(writer, "{}", format_balance(self, config))
     }
 }
 

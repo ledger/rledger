@@ -163,7 +163,7 @@ impl Dispatcher {
                 return Err(anyhow::anyhow!("Journal file not found: {}", file.display()));
             }
 
-            journal.merge(parser.parse_file(&file)?).map_err(|err| anyhow::anyhow!(err))?;
+            journal.merge(parser.parse_file(file)?).map_err(|err| anyhow::anyhow!(err))?;
         }
 
         self.session.parsed_journal = Some(journal);

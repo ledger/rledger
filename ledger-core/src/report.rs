@@ -233,7 +233,7 @@ impl BalanceReport {
                     if !options.flat {
                         let mut parent_path = account_name;
                         while let Some((path, _)) = parent_path.rsplit_once(":") {
-                            account_tree.find_account(&path, true);
+                            account_tree.find_account(path, true);
 
                             let parent_balance =
                                 account_balances.entry(path.to_string()).or_default();
@@ -897,7 +897,7 @@ impl ReportGenerator for RegisterReport {
         // Write each entry
         for posting_entries in transaction_entries {
             for (i, entry) in posting_entries.iter().enumerate() {
-                let line = self.format_entry(&entry, i > 0, options);
+                let line = self.format_entry(entry, i > 0, options);
                 writeln!(writer, "{}", line).map_err(|e| ReportError::IoError(e.to_string()))?;
 
                 // Show related accounts for split transactions

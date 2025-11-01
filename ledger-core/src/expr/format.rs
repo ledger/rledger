@@ -81,7 +81,7 @@ impl FormatSpec {
                     // Only zero-pad if not left-aligned and not followed by digit
                     if !left_align {
                         chars.next();
-                        if chars.peek().map_or(true, |c| !c.is_ascii_digit()) {
+                        if chars.peek().is_none_or(|c| !c.is_ascii_digit()) {
                             zero_pad = true;
                             continue;
                         } else {

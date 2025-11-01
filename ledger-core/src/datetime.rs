@@ -962,7 +962,7 @@ impl DateInterval {
 
     /// Check if a date falls within this interval
     pub fn contains(&self, date: NaiveDate) -> bool {
-        let after_start = self.start.map_or(true, |start| date >= start);
+        let after_start = self.start.is_none_or(|start| date >= start);
         let before_end = if let Some(end) = self.end {
             if self.end_inclusive {
                 date <= end

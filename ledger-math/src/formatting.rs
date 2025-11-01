@@ -230,7 +230,7 @@ fn format_integer_with_separators(
     for (i, &ch) in chars.iter().enumerate() {
         result.push(ch);
         let remaining = chars.len() - i - 1;
-        if remaining > 0 && remaining % 3 == 0 {
+        if remaining > 0 && remaining.is_multiple_of(3) {
             result.push_str(separator);
         }
     }

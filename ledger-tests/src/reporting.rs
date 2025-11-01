@@ -413,14 +413,14 @@ impl ProgressReporter {
         print!("{}", status_char);
 
         // Print newline every 50 tests
-        if self.completed_tests % 50 == 0 {
+        if self.completed_tests.is_multiple_of(50) {
             println!(" ({}/{})", self.completed_tests, self.total_tests);
         }
     }
 
     /// Finish progress reporting
     pub fn finish(&self) {
-        if self.show_progress && self.completed_tests % 50 != 0 {
+        if self.show_progress && !self.completed_tests.is_multiple_of(50) {
             println!(" ({}/{})", self.completed_tests, self.total_tests);
         }
     }
