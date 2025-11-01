@@ -1110,7 +1110,7 @@ checksum = "bbd2bcb4c963f2ddae06a2efc7e9f3591312473c50c6685e1f298068316e66fe"
 
 [[package]]
 name = "ledger-cli"
-version = "3.0.0"
+version = "3.5.0"
 dependencies = [
  "anyhow",
  "assert_cmd",
@@ -1140,7 +1140,7 @@ dependencies = [
 
 [[package]]
 name = "ledger-core"
-version = "3.0.0"
+version = "3.5.0"
 dependencies = [
  "ahash 0.8.12",
  "anyhow",
@@ -1181,7 +1181,7 @@ dependencies = [
 
 [[package]]
 name = "ledger-math"
-version = "3.0.0"
+version = "3.5.0"
 dependencies = [
  "bitflags 2.9.3",
  "chrono",
@@ -1200,7 +1200,7 @@ dependencies = [
 
 [[package]]
 name = "ledger-tests"
-version = "3.0.0"
+version = "3.5.0"
 dependencies = [
  "anyhow",
  "cargo-fuzz",
@@ -1524,7 +1524,7 @@ dependencies = [
 
 [[package]]
 name = "parser-test"
-version = "3.0.0"
+version = "3.5.0"
 dependencies = [
  "anyhow",
  "chrono",
