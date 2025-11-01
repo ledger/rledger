@@ -10,7 +10,7 @@ account Assets:Checking
     Assets:Checking     $100.00
     Expenses:Food
 
-2024/01/02 Another transaction  
+2024/01/02 Another transaction
     Assets:Checking     €200.00
     Expenses:Travel     -€200.00
 
@@ -32,7 +32,7 @@ commodity EUR
             println!("✓ Parsed successfully!");
             println!("Transactions: {}", journal.transactions.len());
             println!("Accounts found: {}", journal.accounts.len());
-            println!("Commodities found: {}", journal.commodities.len());
+            println!("Commodities found: {}", journal.commodity_pool.commodity_count());
 
             // List accounts
             println!("\nAccounts:");
@@ -42,7 +42,7 @@ commodity EUR
 
             // List commodities
             println!("\nCommodities:");
-            for symbol in journal.commodities.keys() {
+            for symbol in journal.commodity_pool.commodity_map().keys() {
                 println!("  {}", symbol);
             }
 

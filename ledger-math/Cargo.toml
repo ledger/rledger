@@ -18,6 +18,7 @@ serde = { workspace = true }
 chrono = { workspace = true }
 chrono-tz = { workspace = true }
 bitflags = { workspace = true }
+unicode-width = { workspace = true }
 
 [dev-dependencies]
 proptest = { workspace = true }

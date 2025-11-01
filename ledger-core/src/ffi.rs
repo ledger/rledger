@@ -1171,10 +1171,10 @@ pub extern "C" fn ledger_rc_journal_clone(journal: *const RcJournal) -> *mut RcJ
 #[no_mangle]
 pub extern "C" fn ledger_rc_journal_free(journal: *mut RcJournal) {
     if !journal.is_null() {
-        unsafe {
-            let _journal = Box::from_raw(journal);
-            // Arc will decrement reference count and free when it reaches zero
-        }
+        // unsafe {
+        //     let _journal = Box::from_raw(journal);
+        //     // Arc will decrement reference count and free when it reaches zero
+        // }
     }
 }
 

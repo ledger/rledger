@@ -233,7 +233,7 @@ impl BalanceReport {
                     if !options.flat {
                         let mut parent_path = account_name;
                         while let Some((path, _)) = parent_path.rsplit_once(":") {
-                            account_tree.find_account(&path, true);
+                            account_tree.find_account(path, true);
 
                             let parent_balance =
                                 account_balances.entry(path.to_string()).or_default();
@@ -887,57 +887,6 @@ impl RegisterReport {
 
         lines.join("\n")
     }
-
-    /// Format header line for the register report
-    fn format_header(&self) -> String {
-        let mut headers = Vec::new();
-
-        if self.columns.date {
-            let width = self.columns.widths.get("date").copied().unwrap_or(10);
-            headers.push(format!("{:<width$}", "Date", width = width));
-        }
-
-        if self.columns.code {
-            let width = self.columns.widths.get("code").copied().unwrap_or(6);
-            headers.push(format!("{:<width$}", "Code", width = width));
-        }
-
-        if self.columns.payee {
-            let width = self.columns.widths.get("payee").copied().unwrap_or(if self.wide_format {
-                30
-            } else {
-                20
-            });
-            headers.push(format!("{:<width$}", "Payee", width = width));
-        }
-
-        if self.columns.account {
-            let width = self
-                .columns
-                .widths
-                .get("account")
-                .copied()
-                .unwrap_or(if self.wide_format { 40 } else { 25 });
-            headers.push(format!("{:<width$}", "Account", width = width));
-        }
-
-        if self.columns.amount {
-            let width = self.columns.widths.get("amount").copied().unwrap_or(12);
-            headers.push(format!("{:>width$}", "Amount", width = width));
-        }
-
-        if self.columns.balance {
-            let width = self.columns.widths.get("balance").copied().unwrap_or(15);
-            headers.push(format!("{:>width$}", "Balance", width = width));
-        }
-
-        if self.columns.note {
-            let width = self.columns.widths.get("note").copied().unwrap_or(20);
-            headers.push(format!("{:<width$}", "Note", width = width));
-        }
-
-        headers.join(" ")
-    }
 }
 
 impl ReportGenerator for RegisterReport {
@@ -945,19 +894,10 @@ impl ReportGenerator for RegisterReport {
         // Collect register entries
         let transaction_entries = self.collect_entries(options)?;
 
-        // TODO: disable header for now
-        // // Write header
-        // let header = self.format_header();
-        // writeln!(writer, "{}", header).map_err(|e| ReportError::IoError(e.to_string()))?;
-
-        // // Write separator line
-        // writeln!(writer, "{}", "-".repeat(header.len()))
-        //     .map_err(|e| ReportError::IoError(e.to_string()))?;
-
         // Write each entry
         for posting_entries in transaction_entries {
             for (i, entry) in posting_entries.iter().enumerate() {
-                let line = self.format_entry(&entry, i > 0, options);
+                let line = self.format_entry(entry, i > 0, options);
                 writeln!(writer, "{}", line).map_err(|e| ReportError::IoError(e.to_string()))?;
 
                 // Show related accounts for split transactions
@@ -1028,7 +968,7 @@ impl ReportGenerator for PrintReport {
             }
 
             transaction
-                .write(writer, &self.journal.commodities)
+                .write(writer, self.journal.commodity_pool.commodity_map())
                 .map_err(|e| ReportError::IoError(e.to_string()))?;
         }
 

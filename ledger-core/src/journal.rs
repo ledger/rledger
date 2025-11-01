@@ -3,10 +3,10 @@
 use crate::account::{Account, AccountRef};
 use crate::transaction::Transaction;
 use ledger_math::commodity::Commodity;
+use ledger_math::CommodityPool;
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::Rc;
-use std::sync::Arc;
 
 /// Main journal containing all transactions
 #[derive(Debug, Default, Clone)]
@@ -16,7 +16,7 @@ pub struct Journal {
     /// Account registry
     pub accounts: HashMap<String, AccountRef>,
     /// Commodity registry
-    pub commodities: HashMap<String, Arc<Commodity>>,
+    pub commodity_pool: CommodityPool,
     /// Next account ID
     next_account_id: usize,
 }
@@ -61,12 +61,12 @@ impl Journal {
     }
 
     /// Add a commodity to the journal
-    pub fn add_commodity(&mut self, commodity: Arc<Commodity>) -> Result<(), String> {
+    pub fn add_commodity(&mut self, commodity: Commodity) -> Result<(), String> {
         let symbol = commodity.symbol().to_string();
-        if self.commodities.contains_key(&symbol) {
+        if self.commodity_pool.has_commodity(&symbol) {
             return Err(format!("Commodity already exists: {}", symbol));
         }
-        self.commodities.insert(symbol, commodity);
+        self.commodity_pool.insert(commodity);
         Ok(())
     }
 
@@ -81,8 +81,8 @@ impl Journal {
         }
 
         // Merge commodities
-        for (symbol, commodity) in other.commodities {
-            self.commodities.entry(symbol).or_insert(commodity);
+        for commodity in other.commodity_pool.commodities() {
+            self.commodity_pool.insert_ref(commodity);
         }
 
         Ok(())
@@ -110,10 +110,17 @@ mod tests {
 
     use insta::assert_snapshot;
 
-    use crate::parser::JournalParser;
+    use crate::parser::{reset_parse_state, JournalParser};
+
+    fn init() {
+        let _ = env_logger::builder().is_test(true).try_init();
+        reset_parse_state();
+    }
 
     #[test]
-    fn test_parse_and_format_journal() {
+    fn test_parse_and_format_journal_1() {
+        init();
+
         let input = textwrap::dedent(
             "
             1999/11/01 * Achat
@@ -138,6 +145,90 @@ mod tests {
                 Actif:SSB                               -125 STK
                 Dépense:SSB:Commissions                  55,07 $
                 Actif:SSB                              1821,54 $
+        "#);
+    }
+
+    #[test]
+    fn test_parse_and_format_journal_optional_year() {
+        init();
+
+        let input = textwrap::dedent(
+            "
+            year 1999
+
+            11/01 A
+                B  $1
+                C
+            ",
+        );
+        let mut parser = JournalParser::new();
+        let journal = parser.parse_journal(&input).unwrap();
+
+        assert_snapshot!(journal.format_transactions(), @r#"
+            1999/11/01 A
+                B                                             $1
+                C
+        "#);
+    }
+
+    #[test]
+    fn test_parse_and_format_journal_with_widening_commodities() {
+        init();
+
+        // from test/regress/1D275740.test
+        let input = textwrap::dedent(
+            "
+            2001/12/21 Payee
+                A                                             $1
+                A                                         $1.000
+                A                                             ¢1
+                A
+            ",
+        );
+        let mut parser = JournalParser::new();
+        let journal = parser.parse_journal(&input).unwrap();
+
+        // $1 should expand to 3 decimal places even though it was seen first
+        // ¢1 should stay w/ no decimal places
+        assert_snapshot!(journal.format_transactions(), @r#"
+            2001/12/21 Payee
+                A                                         $1.000
+                A                                         $1.000
+                A                                             ¢1
+                A
+        "#);
+    }
+
+    #[test]
+    fn test_parse_and_format_journal_with_default_commodity() {
+        init();
+
+        // from test/regress/1D275740.test
+        let input = textwrap::dedent(
+            "
+            D 1.200,40 €
+
+            2009/08/01 Achat
+               Actif:SV                 1,0204 MFE @ 333,200 €
+               Actif:BC                           -340,00 €
+
+            2009/09/29 Vente
+               Actif:SV                 -0,0415 MFE @ 358,800 €
+               Actif:SV                      14,89 €
+            ",
+        );
+        let mut parser = JournalParser::new();
+        let journal = parser.parse_journal(&input).unwrap();
+
+        // assert_debug_snapshot!(journal.transactions, @r#""#);
+        assert_snapshot!(journal.format_transactions(), @r#"
+            2009/08/01 Achat
+                Actif:SV                              1,0204 MFE @ 333,20 €
+                Actif:BC                               -340,00 €
+
+            2009/09/29 Vente
+                Actif:SV                             -0,0415 MFE @ 358,80 €
+                Actif:SV                                 14,89 €
         "#);
     }
 }

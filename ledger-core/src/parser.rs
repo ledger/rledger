@@ -8,12 +8,13 @@
 //! - Include file resolution with cycle detection
 //! - Streaming parser for large files
 
-use ledger_math::{commodity::Precision, Annotation, CommodityFlags};
+use ledger_math::{commodity::Precision, Annotation, CommodityFlags, CommodityPool};
+use log::debug;
 use nom::{
     branch::alt,
     bytes::complete::{is_not, take_until, take_while_m_n},
     character::complete::{char, digit1, line_ending, space0, space1},
-    combinator::{map, not, opt, recognize, success, value},
+    combinator::{consumed, map, not, opt, success, value, verify},
     error::{context, ParseError},
     multi::{many0, many1, many_m_n},
     sequence::{delimited, pair, preceded, terminated, tuple},
@@ -40,7 +41,7 @@ use crate::{
     transaction::{TagData, Transaction},
 };
 
-use chrono::NaiveDate;
+use chrono::{Datelike, Local, NaiveDate};
 use rust_decimal::Decimal;
 
 /// Custom error type for parser errors with source location tracking
@@ -99,6 +100,18 @@ fn tag<'a>(s: &'a str) -> impl Fn(&'a str) -> ParseResult<'a, &'a str> + 'a {
     }
 }
 
+// thread_local! allows shared global state during parse while still allowing us
+// to run tests in parallel. Won't work if parsing is ever multithreaded.
+thread_local! {
+    /// Global parse state.
+    static PARSE_STATE: RefCell<ParseContext> = RefCell::new(ParseContext::default())
+}
+
+#[cfg(test)]
+pub fn reset_parse_state() {
+    PARSE_STATE.with_borrow_mut(|c| c.commodity_pool = CommodityPool::new());
+}
+
 /// Parser state structure for context management
 #[derive(Debug, Clone)]
 pub struct ParseContext {
@@ -116,6 +129,8 @@ pub struct ParseContext {
     pub current_year: Option<i32>,
     /// Default account for unbalanced postings
     pub default_account: Option<String>,
+    /// Commodity pool
+    pub commodity_pool: CommodityPool,
     /// Commodity aliases
     pub commodity_aliases: HashMap<String, String>,
     /// Account aliases
@@ -132,6 +147,7 @@ impl Default for ParseContext {
             apply_stack: Vec::new(),
             current_year: None,
             default_account: None,
+            commodity_pool: CommodityPool::new(),
             commodity_aliases: HashMap::new(),
             account_aliases: HashMap::new(),
         }
@@ -186,7 +202,7 @@ pub enum Directive {
         declarations: Vec<CommodityDeclaration>,
     },
     DefaultCommodity {
-        symbol: String,
+        commodity: Arc<Commodity>,
     },
 
     // Price directives
@@ -327,7 +343,12 @@ impl JournalParser {
 
     /// Parse a complete journal from a string
     pub fn parse_journal(&mut self, input: &str) -> Result<Journal, JournalParseError> {
-        let entries = self.parse_entries(input)?;
+        let entries = {
+            PARSE_STATE.with_borrow_mut(|c| c.commodity_pool = self.context.commodity_pool.clone());
+            let entries = self.parse_entries(input)?;
+            self.context.commodity_pool = PARSE_STATE.with_borrow_mut(|c| c.commodity_pool.clone());
+            entries
+        };
         let journal = self.build_journal(entries)?;
         Ok(journal)
     }
@@ -363,6 +384,7 @@ impl JournalParser {
     /// Build journal from parsed entries
     fn build_journal(&mut self, entries: Vec<JournalEntry>) -> Result<Journal, JournalParseError> {
         let mut journal = Journal::new();
+        journal.commodity_pool = self.context.commodity_pool.clone();
 
         for entry in entries {
             match entry {
@@ -413,69 +435,71 @@ impl JournalParser {
             let _ = journal.get_or_create_account(&account_name);
 
             // Register commodity from the amount if present
-            if let Some(amount) = &posting.amount {
-                self.register_commodity_for_amount(amount, journal);
-                if let Some(price) =
-                    amount.commodity().and_then(|c| c.annotation().price().as_ref())
-                {
-                    self.register_commodity_for_amount(price, journal);
-                }
-            }
-            if let Some(cost) = &posting.given_cost {
-                self.register_commodity_for_amount(cost, journal);
-                // NOTE: technically, the commodity of a cost could have a
-                // price, but I don't believe it ever does in practice
-            }
+            // if let Some(amount) = &posting.amount {
+            //     self.register_commodity_for_amount(amount, journal);
+            //     if let Some(price) =
+            //         amount.commodity().and_then(|c| c.annotation().price().as_ref())
+            //     {
+            //         self.register_commodity_for_amount(price, journal);
+            //     }
+            // }
+            // if let Some(cost) = &posting.given_cost {
+            //     self.register_commodity_for_amount(cost, journal);
+            //     // NOTE: technically, the commodity of a cost could have a
+            //     // price, but I don't believe it ever does in practice
+            // }
         }
     }
 
-    fn register_commodity_for_amount(&mut self, amount: &Amount, journal: &mut Journal) {
-        if let Some(commodity_ref) = amount.commodity() {
-            let new_commodity = commodity_ref.clone();
-            let symbol = new_commodity.symbol().to_string();
+    // fn register_commodity_for_amount(&mut self, amount: &Amount, journal: &mut Journal) {
+    //     if let Some(commodity_ref) = amount.commodity() {
+    //         let new_commodity = commodity_ref.clone();
+    //         let symbol = new_commodity.symbol().to_string();
 
-            // Add commodity if it doesn't exist in the journal
-            if let Some(previous_commodity) = journal.commodities.get(&symbol) {
-                if previous_commodity.precision() < new_commodity.precision()
-                    || previous_commodity.flags() != new_commodity.flags()
-                    || previous_commodity.annotation() != new_commodity.annotation()
-                {
-                    // FIXME: this seems messy
-                    let mut new_commodity = Arc::unwrap_or_clone(new_commodity);
+    //         // Add commodity if it doesn't exist in the journal
+    //         if let Some(previous_commodity) = journal.commodities.get(&symbol) {
+    //             if previous_commodity.precision() < new_commodity.precision()
+    //                 || previous_commodity.flags() != new_commodity.flags()
+    //                 || previous_commodity.annotation() != new_commodity.annotation()
+    //             {
+    //                 // FIXME: this seems messy
+    //                 let mut new_commodity = Arc::unwrap_or_clone(new_commodity);
 
-                    if new_commodity.precision() < previous_commodity.precision() {
-                        new_commodity.set_precision(previous_commodity.precision());
-                    }
-                    new_commodity.add_flags(previous_commodity.flags());
+    //                 if new_commodity.precision() < previous_commodity.precision() {
+    //                     new_commodity.set_precision(previous_commodity.precision());
+    //                 }
+    //                 new_commodity.add_flags(previous_commodity.flags());
 
-                    match (
-                        new_commodity.annotation().price(),
-                        previous_commodity.annotation().price(),
-                    ) {
-                        (Some(new_commodity_price), Some(previous_commodity_price))
-                            if new_commodity_price < previous_commodity_price =>
-                        {
-                            new_commodity
-                                .annotation_mut()
-                                .set_price(previous_commodity_price.clone());
-                        }
-                        (None, Some(previous_commodity_price)) => {
-                            new_commodity
-                                .annotation_mut()
-                                .set_price(previous_commodity_price.clone());
-                        }
-                        (Some(_), Some(_)) | (Some(_), None) | (None, None) => {}
-                    }
+    //                 match (
+    //                     new_commodity.annotation().price(),
+    //                     previous_commodity.annotation().price(),
+    //                 ) {
+    //                     (Some(new_commodity_price), Some(previous_commodity_price))
+    //                         if new_commodity_price < previous_commodity_price =>
+    //                     {
+    //                         new_commodity
+    //                             .annotation_mut()
+    //                             .set_price(previous_commodity_price.clone());
+    //                     }
+    //                     (None, Some(previous_commodity_price)) => {
+    //                         new_commodity
+    //                             .annotation_mut()
+    //                             .set_price(previous_commodity_price.clone());
+    //                     }
+    //                     (Some(_), Some(_)) | (Some(_), None) | (None, None) => {}
+    //                 }
 
-                    journal.commodities.insert(symbol.clone(), Arc::new(new_commodity));
-                }
-            } else {
-                journal.commodities.insert(symbol.clone(), new_commodity.clone());
-            }
-        }
-    }
+    //                 journal.commodities.insert(symbol.clone(), Arc::new(new_commodity));
+    //             }
+    //         } else {
+    //             journal.commodities.insert(symbol.clone(), new_commodity.clone());
+    //         }
+    //     }
+    // }
 
-    /// Process a parsed directive with include handling
+    /// Process a parsed directive with include handling. Happens after entire
+    /// journal is parsed. For processing directives during parse, see
+    /// `process_directive_inline`
     fn process_directive(
         &mut self,
         journal: &mut Journal,
@@ -514,7 +538,7 @@ impl JournalParser {
                     }
                 }
                 // TODO: error logging
-                let _ = journal.add_commodity(Arc::new(commodity));
+                let _ = journal.add_commodity(commodity);
             }
             Directive::Include { path } => {
                 self.process_include_file(journal, &path)?;
@@ -539,7 +563,23 @@ impl JournalParser {
                     postings.len()
                 );
             }
-            // Handle other directives
+            // TODO:
+            // Directive::Alias { account, alias } => todo!(),
+            // Directive::Apply { state } => todo!(),
+            // Directive::End => todo!(),
+            // Directive::Assert { condition } => todo!(),
+            // Directive::Check { condition } => todo!(),
+            // Directive::DefaultCommodity { symbol } => todo!(),
+            // Directive::Price { date, commodity, price } => todo!(),
+            // Directive::Payee { name, declarations } => todo!(),
+            // Directive::Tag { name } => todo!(),
+            // Directive::Option { name, value } => todo!(),
+            // Directive::Eval { expression } => todo!(),
+            // Directive::Define { name, expression } => todo!(),
+
+            // no after-parse processing for these directives
+            Directive::Year { .. } => {}
+
             _ => {}
         }
 
@@ -1189,114 +1229,100 @@ fn transaction_entry(input: &str) -> ParseResult<'_, Transaction> {
 
 /// Parse a complete transaction with metadata support
 fn parse_transaction(input: &str) -> ParseResult<'_, Transaction> {
-    map(
-        tuple((
-            date_field,
-            opt(preceded(tag("="), date_field)), // aux date
-            space0,
-            opt(alt((tag("*"), tag("!")))), // cleared flag
-            space0,
-            opt(delimited(tag("("), take_until(")"), tag(")"))), // code
-            space0,
-            opt(payee_description),
-            space0,
-            // transaction comment on payee line
-            opt(simple_comment_field),
-            line_ending,
-            // transaction comments between payees and postings
-            many0(delimited(alt((space1, tag("\t"))), simple_comment_field, line_ending)),
-            many0(posting_line),
-        )),
-        |(date, aux_date, _, cleared, _, code, _, payee, _, comment1, _, comment2, postings)| {
-            let payee_str = payee.unwrap_or_else(String::new);
-            let mut transaction = Transaction::new(date, payee_str);
+    let mut parser = tuple((
+        date_field,
+        opt(preceded(tag("="), date_field)), // aux date
+        space0,
+        opt(alt((tag("*"), tag("!")))), // cleared flag
+        space0,
+        opt(delimited(tag("("), take_until(")"), tag(")"))), // code
+        space0,
+        opt(payee_description),
+        space0,
+        // transaction comment on payee line
+        opt(simple_comment_field),
+        line_ending,
+        // transaction comments between payees and postings
+        many0(delimited(alt((space1, tag("\t"))), simple_comment_field, line_ending)),
+        many0(posting_line),
+    ));
 
-            if let Some(aux_date) = aux_date {
-                transaction.set_aux_date(Some(aux_date));
-            }
+    let (rest, (date, aux_date, _, cleared, _, code, _, payee, _, comment1, _, comment2, postings)) =
+        parser(input)?;
 
-            if let Some(cleared) = cleared {
-                match cleared {
-                    "*" => transaction.set_status(crate::transaction::TransactionStatus::Cleared),
-                    "!" => transaction.set_status(crate::transaction::TransactionStatus::Pending),
-                    _ => {}
-                }
-            }
+    let payee_str = payee.unwrap_or_else(String::new);
+    let mut transaction = Transaction::new(date, payee_str);
 
-            if let Some(code) = code {
-                transaction.set_code(Some(code.to_string()));
-            }
+    if let Some(aux_date) = aux_date {
+        transaction.set_aux_date(Some(aux_date));
+    }
 
-            // Extract metadata from transaction comment
-            if comment1.is_some() || !comment2.is_empty() {
-                let comment = [comment1.unwrap_or_default(), comment2.join("\n")].join("\n");
-                let metadata = parse_metadata_tags(&comment, None);
+    if let Some(cleared) = cleared {
+        match cleared {
+            "*" => transaction.set_status(crate::transaction::TransactionStatus::Cleared),
+            "!" => transaction.set_status(crate::transaction::TransactionStatus::Pending),
+            _ => {}
+        }
+    }
 
-                transaction.note = Some(comment);
+    if let Some(code) = code {
+        transaction.set_code(Some(code.to_string()));
+    }
 
-                if let Some(payee) = metadata.get("Payee") {
-                    transaction.payee = payee.clone();
-                }
+    // Extract metadata from transaction comment
+    if comment1.is_some() || !comment2.is_empty() {
+        let comment = [comment1.unwrap_or_default(), comment2.join("\n")].join("\n");
+        let metadata = parse_metadata_tags(&comment, None);
 
-                let metadata: HashMap<String, TagData> =
-                    metadata.into_iter().map(|(key, value)| (key, TagData::new(value))).collect();
-                transaction.metadata.extend(metadata);
-            }
+        transaction.note = Some(comment);
 
-            for posting in postings {
-                transaction.add_posting(posting);
-            }
+        if let Some(payee) = metadata.get("Payee") {
+            transaction.payee = payee.clone();
+        }
 
-            transaction
-        },
-    )(input)
+        let metadata: HashMap<String, TagData> =
+            metadata.into_iter().map(|(key, value)| (key, TagData::new(value))).collect();
+        transaction.metadata.extend(metadata);
+    }
+
+    for posting in postings {
+        transaction.add_posting(posting);
+    }
+
+    Ok((rest, transaction))
 }
 
 /// Parse a date field
 fn date_field(input: &str) -> ParseResult<'_, NaiveDate> {
-    // Parse date in various formats
-    alt((
-        // ISO date format: 2021-01-01
-        map(recognize(tuple((digit1, tag("-"), digit1, tag("-"), digit1))), |date_str: &str| {
-            // Parse YYYY-MM-DD format
-            let parts: Vec<&str> = date_str.split('-').collect();
-            if parts.len() == 3 {
-                let year = parts[0].parse::<i32>().unwrap_or(2024);
-                let month = parts[1].parse::<u32>().unwrap_or(1);
-                let day = parts[2].parse::<u32>().unwrap_or(1);
-                NaiveDate::from_ymd_opt(year, month, day)
-                    .unwrap_or_else(|| NaiveDate::from_ymd_opt(2024, 1, 1).unwrap())
+    let date_with_optional_year = |sep| {
+        tuple((
+            opt(terminated(verify(digit1, |s: &str| s.len() == 4), tag(sep))),
+            terminated(verify(digit1, |s: &str| (1..=2).contains(&s.len())), tag(sep)),
+            terminated(verify(digit1, |s: &str| (1..=2).contains(&s.len())), not(tag(sep))),
+        ))
+    };
+
+    map(
+        alt((
+            date_with_optional_year("/"),
+            date_with_optional_year("-"),
+            date_with_optional_year("."),
+        )),
+        |(year, month, day)| {
+            let default_year = PARSE_STATE
+                .with_borrow_mut(|c| c.current_year.unwrap_or_else(|| Local::now().year()));
+
+            let year = if let Some(year) = year {
+                year.parse::<i32>().unwrap_or(default_year)
             } else {
-                NaiveDate::from_ymd_opt(2024, 1, 1).unwrap()
-            }
-        }),
-        // Slash format: 2021/01/01 or 01/01
-        map(
-            recognize(tuple((digit1, tag("/"), digit1, opt(tuple((tag("/"), digit1)))))),
-            |date_str: &str| {
-                // Parse date string with slashes
-                let parts: Vec<&str> = date_str.split('/').collect();
-                if parts.len() == 3 {
-                    // YYYY/MM/DD format
-                    let year = parts[0].parse::<i32>().unwrap_or(2024);
-                    let month = parts[1].parse::<u32>().unwrap_or(1);
-                    let day = parts[2].parse::<u32>().unwrap_or(1);
-                    NaiveDate::from_ymd_opt(year, month, day)
-                        .unwrap_or_else(|| NaiveDate::from_ymd_opt(2024, 1, 1).unwrap())
-                } else if parts.len() == 2 {
-                    // MM/DD format - assume current year
-                    use chrono::{Datelike, Local};
-                    let current_year = Local::now().year();
-                    let month = parts[0].parse::<u32>().unwrap_or(1);
-                    let day = parts[1].parse::<u32>().unwrap_or(1);
-                    NaiveDate::from_ymd_opt(current_year, month, day)
-                        .unwrap_or_else(|| NaiveDate::from_ymd_opt(2024, 1, 1).unwrap())
-                } else {
-                    NaiveDate::from_ymd_opt(2024, 1, 1).unwrap()
-                }
-            },
-        ),
-    ))(input)
+                default_year
+            };
+            let month = month.parse::<u32>().unwrap_or(1);
+            let day = day.parse::<u32>().unwrap_or(1);
+
+            NaiveDate::from_ymd_opt(year, month, day).unwrap()
+        },
+    )(input)
 }
 
 /// Parse payee description
@@ -1313,84 +1339,88 @@ fn posting_line(input: &str) -> ParseResult<'_, Posting> {
 pub(crate) fn parse_posting(input: &str) -> ParseResult<'_, Posting> {
     // For now, create a simplified version that compiles
     // TODO: Fix account reference creation and metadata handling
-    map(
-        tuple((
-            account_name,
-            opt(tuple((
-                // amount
-                preceded(pair(alt((tag("  "), tag("\t"))), space0), simple_amount_field),
-                // lot price
-                opt(delimited(
-                    space0,
-                    alt((
-                        map(delimited(char('{'), simple_amount_field, char('}')), |a| (false, a)),
-                        map(delimited(tag("{{"), simple_amount_field, tag("}}")), |a| (true, a)),
-                    )),
-                    space0,
+    let mut parser = tuple((
+        account_name,
+        opt(tuple((
+            // amount
+            preceded(pair(alt((tag("  "), tag("\t"))), space0), simple_amount_field),
+            // lot price
+            opt(delimited(
+                space0,
+                alt((
+                    map(delimited(char('{'), amount_with_minimum_precision, char('}')), |a| {
+                        (false, a)
+                    }),
+                    map(delimited(tag("{{"), amount_with_minimum_precision, tag("}}")), |a| {
+                        (true, a)
+                    }),
                 )),
-                // cost
-                opt(pair(
-                    delimited(space0, map(many_m_n(1, 2, char('@')), |r| r.len() == 2), space0),
-                    simple_amount_field,
-                )),
-            ))),
-            opt(preceded(space0, simple_comment_field)),
-            opt(line_ending),
-        )),
-        |(account, amount_price_cost, comment, _)| {
-            // Create a dummy account reference for now
-            // TODO: Proper account management
-            use compact_str::CompactString;
-            let account_ref = std::rc::Rc::new(std::cell::RefCell::new(
-                crate::account::Account::new(CompactString::from(account), None, 0),
-            ));
-            let mut posting = Posting::new(account_ref);
+                space0,
+            )),
+            // cost
+            opt(pair(
+                delimited(space0, map(many_m_n(1, 2, char('@')), |r| r.len() == 2), space0),
+                amount_with_minimum_precision,
+            )),
+        ))),
+        opt(preceded(space0, simple_comment_field)),
+        opt(line_ending),
+    ));
 
-            if let Some((mut amount, lot_price, cost)) = amount_price_cost {
-                if let Some((calculate_price, mut price)) = lot_price {
-                    if calculate_price {
-                        price.div_amount(&amount).expect("dividing total price by qty");
-                    }
+    let (rest, (account, amount_price_cost, comment, _)) = parser(input)?;
 
-                    if amount.has_commodity() {
-                        let mut commodity =
-                            Arc::unwrap_or_clone(amount.commodity().unwrap().clone());
-                        let mut annotation = commodity.annotation().clone();
-                        annotation.set_price(price);
-                        commodity.set_annotation(annotation);
-                        amount.set_commodity(Arc::new(commodity.clone()));
-                    } else {
-                        let annotation = Annotation::with_price(price);
-                        let commodity = Commodity::with_annotation("", annotation);
-                        amount.set_commodity(Arc::new(commodity));
-                    }
-                }
+    // Create a dummy account reference for now
+    // TODO: Proper account management
+    use compact_str::CompactString;
+    let account_ref = std::rc::Rc::new(std::cell::RefCell::new(crate::account::Account::new(
+        CompactString::from(account),
+        None,
+        0,
+    )));
+    let mut posting = Posting::new(account_ref);
 
-                posting.amount = Some(amount);
-
-                if let Some((calculate_cost, mut cost)) = cost {
-                    if calculate_cost {
-                        cost.div_amount(posting.amount.as_ref().unwrap())
-                            .expect("dividing total cost by qty");
-                        posting.cost = Some(cost);
-                        posting.given_cost = None;
-                    } else {
-                        posting.cost = Some(cost.clone());
-                        posting.given_cost = Some(cost);
-                    }
-                }
+    if let Some((mut amount, lot_price, cost)) = amount_price_cost {
+        if let Some((calculate_price, mut price)) = lot_price {
+            if calculate_price {
+                price.div_amount(&amount).expect("dividing total price by qty");
             }
 
-            // TODO: confirm that amount.commodity != given_cost.commodity
-
-            if let Some(comment) = comment {
-                use compact_str::CompactString;
-                posting.note = Some(CompactString::from(comment));
+            if amount.has_commodity() {
+                let mut commodity = Arc::unwrap_or_clone(amount.commodity().unwrap().clone());
+                let mut annotation = commodity.annotation().clone();
+                annotation.set_price(price);
+                commodity.set_annotation(annotation);
+                amount.set_commodity(Arc::new(commodity.clone()));
+            } else {
+                let annotation = Annotation::with_price(price);
+                let commodity = Commodity::with_annotation("", annotation);
+                amount.set_commodity(Arc::new(commodity));
             }
+        }
 
-            posting
-        },
-    )(input)
+        posting.amount = Some(amount);
+
+        if let Some((calculate_cost, mut cost)) = cost {
+            if calculate_cost {
+                cost.div_amount(posting.amount.as_ref().unwrap())
+                    .expect("dividing total cost by qty");
+                posting.cost = Some(cost);
+                posting.given_cost = None;
+            } else {
+                posting.cost = Some(cost.clone());
+                posting.given_cost = Some(cost);
+            }
+        }
+    }
+
+    // TODO: confirm that amount.commodity != given_cost.commodity
+
+    if let Some(comment) = comment {
+        use compact_str::CompactString;
+        posting.note = Some(CompactString::from(comment));
+    }
+
+    Ok((rest, posting))
 }
 
 /// Parse an account name
@@ -1433,18 +1463,58 @@ fn commodity_symbol(input: &str) -> ParseResult<'_, String> {
     ))(input)
 }
 
-fn quantity(input: &str) -> IResult<&str, (Decimal, Option<CommodityFlags>), VerboseError<&str>> {
-    enum DecimalFormat {
-        Euro,
-        US,
-    }
+#[derive(Debug, PartialEq)]
+struct ParsedQuantity {
+    format: ParsedQuantityFormat,
+    decimal: Decimal,
+    input: String,
+    decimal_format: DecimalFormat,
+    flags: Option<CommodityFlags>,
+}
+
+#[allow(clippy::enum_variant_names)]
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum ParsedQuantityFormat {
+    ThousandsAndDecimal,
+    ThousandsNoDecimal,
+    NoThousandsWithDecimal,
+    NoThousandsNorDecimal,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum DecimalFormat {
+    /// eg 1.000,00
+    Euro,
+    /// eg 1,000.00
+    US,
+}
+
+fn quantity(input: &str) -> IResult<&str, ParsedQuantity, VerboseError<&str>> {
+    quantity_impl(input, QuantityFieldOptions::default())
+}
+
+fn quantity_with_full_precision(input: &str) -> IResult<&str, ParsedQuantity, VerboseError<&str>> {
+    quantity_impl(input, QuantityFieldOptions { keep_full_precision: true, format_hint: None })
+}
+
+#[derive(Debug, Default)]
+struct QuantityFieldOptions {
+    keep_full_precision: bool,
+    format_hint: Option<DecimalFormat>,
+}
+
+fn quantity_impl(
+    input: &str,
+    options: QuantityFieldOptions,
+) -> IResult<&str, ParsedQuantity, VerboseError<&str>> {
+    debug!("quantity_impl: {:?} {:?}", input, &options);
 
     let number_with_separator_and_decimal = |format| {
         let (separator, decimal) = match format {
             DecimalFormat::US => (',', '.'),
             DecimalFormat::Euro => ('.', ','),
         };
-        pair(
+        tuple((
             map(
                 pair(
                     take_while_m_n(1, 3, AsChar::is_dec_digit),
@@ -1464,7 +1534,9 @@ fn quantity(input: &str) -> IResult<&str, (Decimal, Option<CommodityFlags>), Ver
                 },
             ),
             preceded(char(decimal), digit1),
-        )
+            success(ParsedQuantityFormat::ThousandsAndDecimal),
+            success(format),
+        ))
     };
     let number_with_separator_and_no_decimal = |format| {
         let separator = match format {
@@ -1472,7 +1544,7 @@ fn quantity(input: &str) -> IResult<&str, (Decimal, Option<CommodityFlags>), Ver
             DecimalFormat::Euro => '.',
         };
         terminated(
-            pair(
+            tuple((
                 map(
                     pair(
                         take_while_m_n(1, 3, AsChar::is_dec_digit),
@@ -1495,7 +1567,9 @@ fn quantity(input: &str) -> IResult<&str, (Decimal, Option<CommodityFlags>), Ver
                     },
                 ),
                 success(""),
-            ),
+                success(ParsedQuantityFormat::ThousandsNoDecimal),
+                success(format),
+            )),
             // ensure we don't stop matching 1,2345 at the 4
             not(digit1),
         )
@@ -1505,7 +1579,7 @@ fn quantity(input: &str) -> IResult<&str, (Decimal, Option<CommodityFlags>), Ver
             DecimalFormat::US => '.',
             DecimalFormat::Euro => ',',
         };
-        pair(
+        tuple((
             map(digit1, move |s: &str| {
                 (
                     s.to_string(),
@@ -1516,85 +1590,284 @@ fn quantity(input: &str) -> IResult<&str, (Decimal, Option<CommodityFlags>), Ver
                 )
             }),
             preceded(char(decimal), digit1),
-        )
+            success(ParsedQuantityFormat::NoThousandsWithDecimal),
+            success(format),
+        ))
     };
-    let number_without_separator_or_decimal =
-        pair(map(digit1, |s: &str| (s.to_string(), None)), success(""));
+    let number_without_separator_or_decimal = tuple((
+        map(digit1, |s: &str| (s.to_string(), None)),
+        success(""), // no decimal portion
+        success(ParsedQuantityFormat::NoThousandsNorDecimal),
+        success(DecimalFormat::US),
+    ));
 
-    map(
-        tuple((
-            opt(tag("-")),
-            space0,
-            alt((
-                number_with_separator_and_decimal(DecimalFormat::US),
-                number_with_separator_and_decimal(DecimalFormat::Euro),
-                number_with_separator_and_no_decimal(DecimalFormat::US),
-                number_with_separator_and_no_decimal(DecimalFormat::Euro),
-                number_without_separator_with_decimal(DecimalFormat::US),
-                number_without_separator_with_decimal(DecimalFormat::Euro),
-                number_without_separator_or_decimal,
-            )),
-        )),
-        |(maybe_sign, _, ((integer, flags), fraction))| {
-            let mut decimal_str = format!("{sign}{integer}", sign = maybe_sign.unwrap_or(""));
+    let result = match options.format_hint {
+        Some(decimal_format) => {
+            let mut parser = consumed(tuple((
+                opt(tag("-")),
+                space0,
+                alt((
+                    number_with_separator_and_decimal(decimal_format),
+                    number_with_separator_and_no_decimal(decimal_format),
+                    number_without_separator_with_decimal(decimal_format),
+                    number_without_separator_or_decimal,
+                )),
+            )));
 
-            if !fraction.is_empty() {
-                decimal_str.push('.');
-                decimal_str.push_str(fraction);
-            }
+            parser(input)
+        }
+        None => {
+            let mut parser = consumed(tuple((
+                opt(tag("-")),
+                space0,
+                alt((
+                    number_with_separator_and_decimal(DecimalFormat::US),
+                    number_with_separator_and_decimal(DecimalFormat::Euro),
+                    number_with_separator_and_no_decimal(DecimalFormat::US),
+                    number_with_separator_and_no_decimal(DecimalFormat::Euro),
+                    number_without_separator_with_decimal(DecimalFormat::US),
+                    number_without_separator_with_decimal(DecimalFormat::Euro),
+                    number_without_separator_or_decimal,
+                )),
+            )));
 
-            (Decimal::from_str(&decimal_str).unwrap_or_default(), flags)
+            parser(input)
+        }
+    };
+
+    let (rest, (matched, (maybe_sign, _, ((integer, flags), fraction, format, decimal_format)))) =
+        result?;
+    let mut decimal_str = format!("{sign}{integer}", sign = maybe_sign.unwrap_or(""));
+
+    if !fraction.is_empty() {
+        let fraction = if options.keep_full_precision {
+            fraction
+        } else {
+            fraction.strip_suffix("0").unwrap_or(fraction)
+        };
+
+        decimal_str.push('.');
+        decimal_str.push_str(fraction);
+    }
+
+    Ok((
+        rest,
+        ParsedQuantity {
+            format,
+            decimal: Decimal::from_str(&decimal_str).unwrap_or_default(),
+            input: matched.to_string(),
+            decimal_format,
+            flags,
         },
-    )(input)
+    ))
 }
 
-/// Parse an amount field (simplified)
+// See C++ version, these use migrate_format_to_commodity: false
+fn _cost_amount(input: &str) -> ParseResult<'_, Amount> {
+    amount_field_impl(input, AmountFieldOptions::default())
+}
+fn _balance_assertion_amount(input: &str) -> ParseResult<'_, Amount> {
+    amount_field_impl(input, AmountFieldOptions::default())
+}
+
+fn default_commodity_amount(input: &str) -> ParseResult<'_, Amount> {
+    amount_field_impl(
+        input,
+        AmountFieldOptions { migrate_format_to_commodity: true, keep_full_precision: true },
+    )
+}
+fn amount_with_minimum_precision(input: &str) -> ParseResult<'_, Amount> {
+    amount_field_impl(
+        input,
+        AmountFieldOptions { migrate_format_to_commodity: true, keep_full_precision: false },
+    )
+}
+
+/// Parse a simple amount field, containing a quantity (number) and commodity
+/// (symbol), in any order.
 fn simple_amount_field(input: &str) -> ParseResult<'_, Amount> {
-    alt((
+    amount_field_impl(
+        input,
+        AmountFieldOptions { migrate_format_to_commodity: true, keep_full_precision: true },
+    )
+}
+
+#[derive(Debug, Default)]
+struct AmountFieldOptions {
+    migrate_format_to_commodity: bool,
+    keep_full_precision: bool,
+}
+
+fn amount_field_impl(input: &str, options: AmountFieldOptions) -> ParseResult<'_, Amount> {
+    debug!("amount_field_impl: {:?} {:?}", input, &options);
+
+    let quantity_field =
+        if options.keep_full_precision { quantity_with_full_precision } else { quantity };
+
+    let mut parser = alt((
         // Commodity before quantity: GBP1, -$1000.00, €-500.50
         // FIXME: what about -$-1?
         map(
-            tuple((opt(terminated(char('-'), space0)), commodity_symbol, space0, quantity)),
-            |(maybe_sign, commodity, maybe_sep, (mut quantity, maybe_flags))| {
-                let commodity = {
-                    let mut commodity =
-                        Commodity::with_precision(commodity, quantity.scale() as Precision);
-                    if !maybe_sep.is_empty() {
-                        commodity.add_flags(CommodityFlags::STYLE_SEPARATED);
-                    }
-                    if let Some(flags) = maybe_flags {
-                        commodity.add_flags(flags);
-                    }
-                    Some(Arc::new(commodity))
-                };
-
+            tuple((opt(terminated(char('-'), space0)), commodity_symbol, space0, quantity_field)),
+            |(maybe_sign, commodity, maybe_sep, mut quantity)| {
                 if maybe_sign.is_some() {
-                    quantity.set_sign_negative(true);
+                    quantity.decimal.set_sign_negative(true);
                 }
 
-                Amount::with_commodity(quantity, commodity)
+                let mut flags = quantity.flags.unwrap_or(CommodityFlags::empty());
+                if !maybe_sep.is_empty() {
+                    flags |= CommodityFlags::STYLE_SEPARATED;
+                }
+                if !flags.is_empty() {
+                    quantity.flags = Some(flags)
+                }
+
+                (quantity, Some(commodity))
             },
         ),
         // Commodity after quantity, and no commodity at all: 10.00 USD, -10.00, 1$
         map(
-            tuple((quantity, opt(pair(space0, commodity_symbol)))),
-            |((quantity, maybe_flags), commodity)| {
-                let commodity = commodity.map(|(sep, commodity)| {
-                    let mut commodity =
-                        Commodity::with_precision(commodity, quantity.scale() as Precision);
-                    commodity.add_flags(CommodityFlags::STYLE_SUFFIXED);
-                    if !sep.is_empty() {
-                        commodity.add_flags(CommodityFlags::STYLE_SEPARATED);
+            tuple((quantity_field, opt(pair(space0, commodity_symbol)))),
+            |(mut quantity, commodity)| {
+                let mut flags = quantity.flags.unwrap_or(CommodityFlags::empty());
+
+                let commodity = if let Some((maybe_sep, commodity)) = commodity {
+                    flags |= CommodityFlags::STYLE_SUFFIXED;
+                    if !maybe_sep.is_empty() {
+                        flags |= CommodityFlags::STYLE_SEPARATED;
                     }
-                    if let Some(flags) = maybe_flags {
-                        commodity.add_flags(flags);
-                    }
-                    Arc::new(commodity)
-                });
-                Amount::with_commodity(quantity, commodity)
+                    Some(commodity)
+                } else {
+                    None
+                };
+
+                if !flags.is_empty() {
+                    quantity.flags = Some(flags)
+                }
+
+                (quantity, commodity)
             },
         ),
-    ))(input)
+    ));
+
+    let (rest, (mut quantity, commodity_symbol)) = parser(input)?;
+
+    debug!("initial qty: {:#?}", &quantity);
+    debug!("detected cmdty: {:?}", &commodity_symbol);
+
+    let commodity = if let Some(commodity_symbol) = commodity_symbol {
+        let commodity =
+            PARSE_STATE.with_borrow_mut(|c| c.commodity_pool.find_or_create(&commodity_symbol));
+        if ["€", "$"].contains(&commodity.symbol()) {
+            debug!(
+                "existing cmdty: {} {} {:#?}",
+                commodity.symbol(),
+                commodity.precision(),
+                commodity.flags()
+            );
+        }
+
+        let existing_format_is_euro = commodity.has_flags(CommodityFlags::STYLE_DECIMAL_COMMA);
+        let try_format = match quantity.decimal_format {
+            DecimalFormat::US if existing_format_is_euro => DecimalFormat::Euro,
+            DecimalFormat::Euro if !existing_format_is_euro => DecimalFormat::US,
+            DecimalFormat::US | DecimalFormat::Euro => quantity.decimal_format,
+        };
+        let possible_incorrect_parse = try_format != quantity.decimal_format;
+
+        debug!(
+            "cmdt euro:{:?} try:{:?} mismatch:{:?}",
+            existing_format_is_euro, try_format, possible_incorrect_parse
+        );
+
+        match quantity.format {
+            // eg 123,456 could be US ThousandsNoDecimal (eg 123,456.00) or
+            // Euro NoThousandsWithDecimal (eg 123.456)
+            ParsedQuantityFormat::ThousandsNoDecimal
+                if !commodity.has_flags(CommodityFlags::STYLE_NO_MIGRATE)
+                    && possible_incorrect_parse =>
+            {
+                if let Ok((_, quantity_retry)) = quantity_impl(
+                    &quantity.input,
+                    QuantityFieldOptions {
+                        keep_full_precision: options.keep_full_precision,
+                        format_hint: Some(try_format),
+                    },
+                ) {
+                    if ["€", "$"].contains(&commodity.symbol()) {
+                        debug!("2nd attempt qty: {:#?}", &quantity_retry);
+                    }
+
+                    quantity.decimal = quantity_retry.decimal;
+
+                    // migrate flags from new/retry qty to first try qty
+                    // because first try may have commodity format flags and
+                    // retry will not
+                    match (quantity.flags, quantity_retry.flags) {
+                        // combine 2nd attempt qty flags w/ existing qty flags
+                        (Some(mut existing_flags), Some(new_flags)) => {
+                            let commodity_format_flags = CommodityFlags::STYLE_THOUSANDS
+                                | CommodityFlags::STYLE_DECIMAL_COMMA;
+                            existing_flags &= !commodity_format_flags;
+                            existing_flags |= new_flags & commodity_format_flags;
+                            quantity.flags = Some(existing_flags);
+                        }
+
+                        // apply 2nd attempt qty flags
+                        (None, Some(new_flags)) => {
+                            quantity.flags = Some(new_flags);
+                        }
+
+                        // remove 2nd attempt qty flags from existing flags
+                        (Some(mut existing_flags), None) => {
+                            let commodity_format_flags = CommodityFlags::STYLE_THOUSANDS
+                                | CommodityFlags::STYLE_DECIMAL_COMMA;
+                            existing_flags &= !commodity_format_flags;
+                            quantity.flags = Some(existing_flags);
+                        }
+
+                        (None, None) => {}
+                    }
+
+                    debug!("updated qty: {:#?}", &quantity);
+                }
+            }
+
+            ParsedQuantityFormat::ThousandsNoDecimal
+            | ParsedQuantityFormat::NoThousandsWithDecimal => {}
+
+            // these are unambiguous
+            ParsedQuantityFormat::NoThousandsNorDecimal
+            | ParsedQuantityFormat::ThousandsAndDecimal => {}
+        }
+
+        let commodity = if options.migrate_format_to_commodity {
+            let mut commodity = Arc::unwrap_or_clone(commodity);
+            commodity.add_flags(quantity.flags.unwrap_or(CommodityFlags::empty()));
+            commodity
+                .set_precision(commodity.precision().max(quantity.decimal.scale() as Precision));
+            if ["€", "$"].contains(&commodity.symbol()) {
+                debug!(
+                    "final cmdty: {} {} {:#?}",
+                    commodity.symbol(),
+                    commodity.precision(),
+                    commodity.flags()
+                );
+            }
+            PARSE_STATE.with_borrow_mut(|c| c.commodity_pool.insert(commodity))
+        } else {
+            commodity
+        };
+
+        Some(commodity)
+    } else {
+        None
+    };
+
+    let mut amount = Amount::with_commodity(quantity.decimal, commodity);
+    amount.set_keep_precision(!options.migrate_format_to_commodity);
+
+    Ok((rest, amount))
 }
 
 /// Parse a comment field with metadata extraction
@@ -1623,26 +1896,62 @@ fn directive_entry(input: &str) -> ParseResult<'_, Directive> {
 
 /// Parse any directive
 fn parse_directive(input: &str) -> ParseResult<'_, Directive> {
-    alt((
-        account_directive,
-        commodity_directive,
-        include_directive,
-        price_directive,
-        alias_directive,
-        apply_directive,
-        end_directive,
-        payee_directive,
-        tag_directive,
-        option_directive,
-        eval_directive,
-        define_directive,
-        year_directive,
-        default_commodity_directive,
-        assert_directive,
-        check_directive,
-        periodic_transaction,
-        automated_transaction,
-    ))(input)
+    map(
+        alt((
+            account_directive,
+            commodity_directive,
+            include_directive,
+            price_directive,
+            alias_directive,
+            apply_directive,
+            end_directive,
+            payee_directive,
+            tag_directive,
+            option_directive,
+            eval_directive,
+            define_directive,
+            year_directive,
+            default_commodity_directive,
+            assert_directive,
+            check_directive,
+            periodic_transaction,
+            automated_transaction,
+        )),
+        process_directive_inline,
+    )(input)
+}
+
+/// Process directives inline, as they are parsed.
+fn process_directive_inline(directive: Directive) -> Directive {
+    match directive {
+        Directive::Year { year } => {
+            PARSE_STATE.with_borrow_mut(|c| c.current_year = Some(year));
+        }
+        Directive::DefaultCommodity { ref commodity } => {
+            PARSE_STATE
+                .with_borrow_mut(|c| c.commodity_pool.set_default_commodity(commodity.clone()));
+        }
+
+        // no inline processing for these directives
+        Directive::Account { .. }
+        | Directive::Alias { .. }
+        | Directive::Apply { .. }
+        | Directive::End
+        | Directive::Assert { .. }
+        | Directive::Check { .. }
+        | Directive::Commodity { .. }
+        | Directive::Price { .. }
+        | Directive::Include { .. }
+        | Directive::ConditionalInclude { .. }
+        | Directive::Payee { .. }
+        | Directive::Tag { .. }
+        | Directive::Option { .. }
+        | Directive::Eval { .. }
+        | Directive::Define { .. }
+        | Directive::PeriodicTransaction { .. }
+        | Directive::AutomatedTransaction { .. } => {}
+    }
+    directive
 }
 
 /// Parse account directive
@@ -1831,16 +2140,25 @@ fn define_directive(input: &str) -> ParseResult<'_, Directive> {
 
 /// Parse year directive
 fn year_directive(input: &str) -> ParseResult<'_, Directive> {
-    map(preceded(tag("year"), preceded(space1, digit1)), |year_str: &str| Directive::Year {
-        year: year_str.parse().unwrap_or(2024),
-    })(input)
+    // FIXME: invalid year should be an error
+    map(
+        preceded(
+            pair(alt((tag("year"), tag("Y"))), space1),
+            verify(digit1, |s: &str| s.len() == 4),
+        ),
+        |year_str: &str| Directive::Year { year: year_str.parse().unwrap_or(2024) },
+    )(input)
 }
 
 /// Parse default commodity directive
 fn default_commodity_directive(input: &str) -> ParseResult<'_, Directive> {
-    map(preceded(tag("D"), preceded(space1, take_until("\n"))), |symbol: &str| {
-        Directive::DefaultCommodity { symbol: symbol.trim().to_string() }
-    })(input)
+    map(
+        preceded(
+            pair(tag("D"), space1),
+            verify(default_commodity_amount, |amount| amount.commodity().is_some()),
+        ),
+        |amount| Directive::DefaultCommodity { commodity: amount.commodity().unwrap().clone() },
+    )(input)
 }
 
 /// Parse assert directive
@@ -1892,6 +2210,11 @@ mod tests {
     use crate::transaction::TransactionStatus;
 
     use super::*;
+
+    fn init() {
+        let _ = env_logger::builder().is_test(true).try_init();
+        reset_parse_state();
+    }
 
     #[test]
     fn test_empty_line() {
@@ -2063,6 +2386,80 @@ mod tests {
     }
 
     #[test]
+    fn test_year_directive() {
+        let (_, year) = year_directive("year 1999").unwrap();
+        let Directive::Year { year } = year else {
+            panic!("did not parse `year` directive");
+        };
+
+        assert_eq!(1999, year);
+
+        let (_, year) = year_directive("Y 2020").unwrap();
+        let Directive::Year { year } = year else {
+            panic!("did not parse `Y` directive");
+        };
+
+        assert_eq!(2020, year);
+    }
+
+    #[test]
+    fn test_parse_dates() {
+        let (_, date) = date_field("2023/01/02").unwrap();
+        assert_eq!(2023, date.year());
+        assert_eq!(1, date.month());
+        assert_eq!(2, date.day());
+        let (_, date1) = date_field("2023.01.02").unwrap();
+        assert_eq!(date, date1);
+        let (_, date2) = date_field("2023-01-02").unwrap();
+        assert_eq!(date, date2);
+
+        // TODO: invalid
+        // let (_, date) = date_field("2023-01/02").unwrap();
+
+        // year optional
+        PARSE_STATE.with_borrow_mut(|c| c.current_year = Some(1999));
+        let (_, date) = date_field("02/03").unwrap();
+        assert_eq!(1999, date.year());
+        assert_eq!(2, date.month());
+        assert_eq!(3, date.day());
+        let (_, date1) = date_field("02.03").unwrap();
+        assert_eq!(date, date1);
+        let (_, date2) = date_field("02-03").unwrap();
+        assert_eq!(date, date2);
+
+        // 1 digit day & month
+        PARSE_STATE.with_borrow_mut(|c| c.current_year = Some(2005));
+        let (_, date) = date_field("4/5").unwrap();
+        assert_eq!(2005, date.year());
+        assert_eq!(4, date.month());
+        assert_eq!(5, date.day());
+
+        // TODO: current year is default; mock now() for testing (ie #[cfg(test)])
+        // let (_, date) = date_field("02/03").unwrap();
+        // assert_eq!(2025, date.year());
+        // assert_eq!(2, date.month());
+        // assert_eq!(3, date.day());
+
+        // 2 digit years are not allowed
+        assert!(date_field("25/04/05").is_err());
+    }
+
+    #[test]
+    fn test_parse_default_commodity() {
+        let (_, commodity) = default_commodity_directive("D 1.00 $").unwrap();
+
+        let Directive::DefaultCommodity { commodity } = commodity else {
+            panic!("did not parse `D` (default commodity) directive");
+        };
+
+        assert_eq!("$", commodity.symbol());
+        assert_eq!(
+            CommodityFlags::STYLE_SUFFIXED | CommodityFlags::STYLE_SEPARATED,
+            commodity.flags()
+        );
+    }
+
+    #[test]
     fn test_parse_commodity() {
         let (_, commodity) = commodity_symbol("USD").unwrap();
         assert_eq!("USD", commodity);
@@ -2082,27 +2479,120 @@ mod tests {
 
     #[test]
     fn test_parse_quantity() {
-        assert_eq!(quantity("1000"), Ok(("", (Decimal::new(1000, 0), None))));
-        assert_eq!(quantity("2.02"), Ok(("", (Decimal::new(202, 2), None))));
-        assert_eq!(quantity("-12.13"), Ok(("", (Decimal::new(-1213, 2), None))));
-        assert_eq!(quantity("0.1"), Ok(("", (Decimal::new(1, 1), None))));
-        assert_eq!(quantity("3"), Ok(("", (Decimal::new(3, 0), None))));
-        assert_eq!(quantity("1"), Ok(("", (Decimal::new(1, 0), None))));
-        assert_eq!(quantity("1 ABC"), Ok((" ABC", (Decimal::new(1, 0), None))));
+        assert_eq!(
+            quantity("1000"),
+            Ok((
+                "",
+                ParsedQuantity {
+                    format: ParsedQuantityFormat::NoThousandsNorDecimal,
+                    decimal: Decimal::new(1000, 0),
+                    input: "1000".to_string(),
+                    decimal_format: DecimalFormat::US,
+                    flags: None
+                }
+            ))
+        );
+
+        assert_eq!(
+            quantity("2.02"),
+            Ok((
+                "",
+                ParsedQuantity {
+                    format: ParsedQuantityFormat::NoThousandsWithDecimal,
+                    decimal: Decimal::new(202, 2),
+                    input: "2.02".to_string(),
+                    decimal_format: DecimalFormat::US,
+                    flags: None
+                }
+            ))
+        );
+
+        assert_eq!(
+            quantity("-12.13"),
+            Ok((
+                "",
+                ParsedQuantity {
+                    format: ParsedQuantityFormat::NoThousandsWithDecimal,
+                    decimal: Decimal::new(-1213, 2),
+                    input: "-12.13".to_string(),
+                    decimal_format: DecimalFormat::US,
+                    flags: None
+                }
+            ))
+        );
+
+        assert_eq!(
+            quantity("0.1"),
+            Ok((
+                "",
+                ParsedQuantity {
+                    format: ParsedQuantityFormat::NoThousandsWithDecimal,
+                    decimal: Decimal::new(1, 1),
+                    input: "0.1".to_string(),
+                    decimal_format: DecimalFormat::US,
+                    flags: None
+                }
+            ))
+        );
+
+        assert_eq!(
+            quantity("3"),
+            Ok((
+                "",
+                ParsedQuantity {
+                    format: ParsedQuantityFormat::NoThousandsNorDecimal,
+                    decimal: Decimal::new(3, 0),
+                    input: "3".to_string(),
+                    decimal_format: DecimalFormat::US,
+                    flags: None
+                }
+            ))
+        );
+
+        assert_eq!(
+            quantity("1"),
+            Ok((
+                "",
+                ParsedQuantity {
+                    format: ParsedQuantityFormat::NoThousandsNorDecimal,
+                    decimal: Decimal::new(1, 0),
+                    input: "1".to_string(),
+                    decimal_format: DecimalFormat::US,
+                    flags: None
+                }
+            ))
+        );
+
+        assert_eq!(
+            quantity("1 ABC"),
+            Ok((
+                " ABC",
+                ParsedQuantity {
+                    format: ParsedQuantityFormat::NoThousandsNorDecimal,
+                    decimal: Decimal::new(1, 0),
+                    input: "1".to_string(),
+                    decimal_format: DecimalFormat::US,
+                    flags: None
+                }
+            ))
+        );
 
         assert_debug_snapshot!(
             quantity("1,000").unwrap(),
             @r#"
                 (
                     "",
-                    (
-                        1000,
-                        Some(
+                    ParsedQuantity {
+                        format: ThousandsNoDecimal,
+                        decimal: 1000,
+                        input: "1,000",
+                        decimal_format: US,
+                        flags: Some(
                             CommodityFlags(
                                 STYLE_THOUSANDS,
                             ),
                         ),
-                    ),
+                    },
                 )
             "#
         );
@@ -2111,14 +2601,17 @@ mod tests {
             @r#"
                 (
                     "",
-                    (
-                        -188.7974,
-                        Some(
+                    ParsedQuantity {
+                        format: NoThousandsWithDecimal,
+                        decimal: -188.7974,
+                        input: "-188,7974",
+                        decimal_format: Euro,
+                        flags: Some(
                             CommodityFlags(
                                 STYLE_DECIMAL_COMMA,
                             ),
                         ),
-                    ),
+                    },
                 )
             "#
         );
@@ -2127,14 +2620,17 @@ mod tests {
             @r#"
                 (
                     "",
-                    (
-                        12456132.14,
-                        Some(
+                    ParsedQuantity {
+                        format: ThousandsAndDecimal,
+                        decimal: 12456132.14,
+                        input: "12,456,132.14",
+                        decimal_format: US,
+                        flags: Some(
                             CommodityFlags(
                                 STYLE_THOUSANDS,
                             ),
                         ),
-                    ),
+                    },
                 )
             "#
         );
@@ -2143,14 +2639,17 @@ mod tests {
             @r#"
                 (
                     "",
-                    (
-                        12456.14,
-                        Some(
+                    ParsedQuantity {
+                        format: ThousandsAndDecimal,
+                        decimal: 12456.14,
+                        input: "12.456,14",
+                        decimal_format: Euro,
+                        flags: Some(
                             CommodityFlags(
                                 STYLE_DECIMAL_COMMA | STYLE_THOUSANDS,
                             ),
                         ),
-                    ),
+                    },
                 )
             "#
         );
@@ -2158,120 +2657,210 @@ mod tests {
 
     #[test]
     fn test_parse_amount() {
-        let (_, amount) = simple_amount_field("1").unwrap();
-        insta::assert_debug_snapshot!(amount, @r#"
-            AMOUNT(1) [prec:0, keep:false, raw:1]
-        "#);
+        init();
 
-        let (_, amount) = simple_amount_field("-1").unwrap();
-        insta::assert_debug_snapshot!(amount, @r#"
-            AMOUNT(-1) [prec:0, keep:false, raw:-1]
-        "#);
+        {
+            let (_, amount) = simple_amount_field("1").unwrap();
+            insta::assert_debug_snapshot!(amount, @r#"
+                AMOUNT(1) [prec:0, keep:false, raw:1]
+            "#);
+        }
 
-        let (_, amount) = simple_amount_field("$1").unwrap();
-        insta::assert_debug_snapshot!(amount, @r#"
-            AMOUNT($1) [prec:0, keep:false, comm:$, raw:1]
-        "#);
-        assert_eq!(CommodityFlags::empty(), amount.commodity().unwrap().flags());
+        {
+            reset_parse_state();
+            let (_, amount) = simple_amount_field("-1").unwrap();
+            insta::assert_debug_snapshot!(amount, @r#"
+                AMOUNT(-1) [prec:0, keep:false, raw:-1]
+            "#);
+        }
 
-        let (_, amount) = simple_amount_field("1$").unwrap();
-        insta::assert_debug_snapshot!(amount, @r#"
-            AMOUNT(1$) [prec:0, keep:false, comm:$, raw:1]
-        "#);
-        assert_eq!(CommodityFlags::STYLE_SUFFIXED, amount.commodity().unwrap().flags());
+        {
+            reset_parse_state();
+            let (_, amount) = simple_amount_field("$1").unwrap();
+            insta::assert_debug_snapshot!(amount, @r#"
+                AMOUNT($1) [prec:0, keep:false, comm:$, raw:1]
+            "#);
+            assert_eq!(CommodityFlags::empty(), amount.commodity().unwrap().flags());
+        }
 
-        let (_, amount) = simple_amount_field("-$1").unwrap();
-        insta::assert_debug_snapshot!(amount, @r#"
-            AMOUNT($-1) [prec:0, keep:false, comm:$, raw:-1]
-        "#);
-        assert_eq!(CommodityFlags::empty(), amount.commodity().unwrap().flags());
+        {
+            reset_parse_state();
+            let (_, amount) = simple_amount_field("1$").unwrap();
+            insta::assert_debug_snapshot!(amount, @r#"
+                AMOUNT(1$) [prec:0, keep:false, comm:$, raw:1]
+            "#);
+            assert_eq!(CommodityFlags::STYLE_SUFFIXED, amount.commodity().unwrap().flags());
+        }
 
-        let (_, amount) = simple_amount_field("$-1").unwrap();
-        insta::assert_debug_snapshot!(amount, @r#"
-            AMOUNT($-1) [prec:0, keep:false, comm:$, raw:-1]
-        "#);
-        assert_eq!(CommodityFlags::empty(), amount.commodity().unwrap().flags());
+        {
+            reset_parse_state();
+            let (_, amount) = simple_amount_field("-$1").unwrap();
+            insta::assert_debug_snapshot!(amount, @r#"
+                AMOUNT($-1) [prec:0, keep:false, comm:$, raw:-1]
+            "#);
+            assert_eq!(CommodityFlags::empty(), amount.commodity().unwrap().flags());
+        }
 
-        let (_, amount) = simple_amount_field("$- 1").unwrap();
-        insta::assert_debug_snapshot!(amount, @r#"
-            AMOUNT($-1) [prec:0, keep:false, comm:$, raw:-1]
-        "#);
-        assert_eq!(CommodityFlags::empty(), amount.commodity().unwrap().flags());
+        {
+            reset_parse_state();
+            let (_, amount) = simple_amount_field("$-1").unwrap();
+            insta::assert_debug_snapshot!(amount, @r#"
+                AMOUNT($-1) [prec:0, keep:false, comm:$, raw:-1]
+            "#);
+            assert_eq!(CommodityFlags::empty(), amount.commodity().unwrap().flags());
+        }
 
-        let (_, amount) = simple_amount_field("$ -1").unwrap();
-        insta::assert_debug_snapshot!(amount, @r#"
-            AMOUNT($ -1) [prec:0, keep:false, comm:$, raw:-1]
-        "#);
-        assert_eq!(CommodityFlags::STYLE_SEPARATED, amount.commodity().unwrap().flags());
+        {
+            reset_parse_state();
+            let (_, amount) = simple_amount_field("$- 1").unwrap();
+            insta::assert_debug_snapshot!(amount, @r#"
+                AMOUNT($-1) [prec:0, keep:false, comm:$, raw:-1]
+            "#);
+            assert_eq!(CommodityFlags::empty(), amount.commodity().unwrap().flags());
+        }
 
-        let (_, amount) = simple_amount_field("$ 1").unwrap();
-        insta::assert_debug_snapshot!(amount, @r#"
-            AMOUNT($ 1) [prec:0, keep:false, comm:$, raw:1]
-        "#);
-        assert_eq!(CommodityFlags::STYLE_SEPARATED, amount.commodity().unwrap().flags());
+        {
+            reset_parse_state();
+            let (_, amount) = simple_amount_field("$ -1").unwrap();
+            insta::assert_debug_snapshot!(amount, @r#"
+                AMOUNT($ -1) [prec:0, keep:false, comm:$, raw:-1]
+            "#);
+            assert_eq!(CommodityFlags::STYLE_SEPARATED, amount.commodity().unwrap().flags());
+        }
 
-        let (_, amount) = simple_amount_field("1 USD").unwrap();
-        insta::assert_debug_snapshot!(amount, @r#"
-            AMOUNT(1 USD) [prec:0, keep:false, comm:USD, raw:1]
-        "#);
-        assert_eq!(
-            CommodityFlags::STYLE_SEPARATED | CommodityFlags::STYLE_SUFFIXED,
-            amount.commodity().unwrap().flags()
-        );
+        {
+            reset_parse_state();
+            let (_, amount) = simple_amount_field("$ 1").unwrap();
+            insta::assert_debug_snapshot!(amount, @r#"
+                AMOUNT($ 1) [prec:0, keep:false, comm:$, raw:1]
+            "#);
+            assert_eq!(CommodityFlags::STYLE_SEPARATED, amount.commodity().unwrap().flags());
+        }
 
-        let (_, amount) = simple_amount_field("1USD").unwrap();
-        insta::assert_debug_snapshot!(amount, @r#"
-            AMOUNT(1USD) [prec:0, keep:false, comm:USD, raw:1]
-        "#);
-        assert_eq!(CommodityFlags::STYLE_SUFFIXED, amount.commodity().unwrap().flags());
+        {
+            reset_parse_state();
+            let (_, amount) = simple_amount_field("1 USD").unwrap();
+            insta::assert_debug_snapshot!(amount, @r#"
+                AMOUNT(1 USD) [prec:0, keep:false, comm:USD, raw:1]
+            "#);
+            assert_eq!(
+                CommodityFlags::STYLE_SEPARATED | CommodityFlags::STYLE_SUFFIXED,
+                amount.commodity().unwrap().flags()
+            );
+        }
 
-        let (_, amount) = simple_amount_field(r#"1000 "M&M""#).unwrap();
-        insta::assert_debug_snapshot!(amount, @r#"
-            AMOUNT(1000 "M&M") [prec:0, keep:false, comm:"M&M", raw:1000]
-        "#);
-        assert_eq!(
-            CommodityFlags::STYLE_SEPARATED | CommodityFlags::STYLE_SUFFIXED,
-            amount.commodity().unwrap().flags()
-        );
+        {
+            reset_parse_state();
+            let (_, amount) = simple_amount_field("1USD").unwrap();
+            insta::assert_debug_snapshot!(amount, @r#"
+                AMOUNT(1USD) [prec:0, keep:false, comm:USD, raw:1]
+            "#);
+            assert_eq!(CommodityFlags::STYLE_SUFFIXED, amount.commodity().unwrap().flags());
+        }
 
-        let (rem, amount) = simple_amount_field("-188,7974 STK @ 14,200 $").unwrap();
-        assert_eq!(rem, " @ 14,200 $");
-        insta::assert_debug_snapshot!(amount, @r#"
-            AMOUNT(-188.7974 STK) [prec:4, keep:false, comm:STK, raw:-943987/5000]
-        "#);
-        assert_eq!(
-            CommodityFlags::STYLE_SUFFIXED
-                | CommodityFlags::STYLE_SEPARATED
-                | CommodityFlags::STYLE_DECIMAL_COMMA,
-            amount.commodity().unwrap().flags()
-        );
+        {
+            reset_parse_state();
+            let (_, amount) = simple_amount_field(r#"1000 "M&M""#).unwrap();
+            insta::assert_debug_snapshot!(amount, @r#"
+                AMOUNT(1000 "M&M") [prec:0, keep:false, comm:"M&M", raw:1000]
+            "#);
+            assert_eq!(
+                CommodityFlags::STYLE_SEPARATED | CommodityFlags::STYLE_SUFFIXED,
+                amount.commodity().unwrap().flags()
+            );
+        }
+
+        {
+            reset_parse_state();
+            let (_, amount) = simple_amount_field("-1672,42 $").unwrap();
+            insta::assert_debug_snapshot!(amount, @r#"
+                AMOUNT(-1672.42 $) [prec:2, keep:false, comm:$, raw:-83621/50]
+            "#);
+            assert_eq!(
+                CommodityFlags::STYLE_SEPARATED
+                    | CommodityFlags::STYLE_SUFFIXED
+                    | CommodityFlags::STYLE_DECIMAL_COMMA,
+                amount.commodity().unwrap().flags()
+            );
+        }
+
+        // FIXME: this parses as 358,800.00 (US) but it should be 358.800 (Euro)
+        {
+            reset_parse_state();
+
+            let mut commodity = Commodity::new("€");
+            commodity.add_flags(CommodityFlags::STYLE_DECIMAL_COMMA);
+            PARSE_STATE.with_borrow_mut(|c| c.commodity_pool.insert(commodity));
+
+            let (_, amount) = simple_amount_field("358,800 €").unwrap();
+            insta::assert_debug_snapshot!(amount, @r#"
+                AMOUNT(358.800 €) [prec:3, keep:false, comm:€, raw:1794/5]
+            "#);
+            assert_eq!(3, amount.commodity().unwrap().precision());
+            assert_eq!(
+                CommodityFlags::STYLE_SUFFIXED
+                    | CommodityFlags::STYLE_SEPARATED
+                    | CommodityFlags::STYLE_DECIMAL_COMMA,
+                amount.commodity().unwrap().flags()
+            );
+
+            // commodity pool is also updated
+            let commodity = PARSE_STATE.with_borrow_mut(|c| c.commodity_pool.find("€").unwrap());
+            assert_eq!(
+                CommodityFlags::STYLE_SUFFIXED
+                    | CommodityFlags::STYLE_SEPARATED
+                    | CommodityFlags::STYLE_DECIMAL_COMMA,
+                commodity.flags()
+            );
+        }
+
+        {
+            reset_parse_state();
+            let (rem, amount) = simple_amount_field("-188,7974 STK @ 14,200 $").unwrap();
+            assert_eq!(rem, " @ 14,200 $");
+            insta::assert_debug_snapshot!(amount, @r#"
+                AMOUNT(-188.7974 STK) [prec:4, keep:false, comm:STK, raw:-943987/5000]
+            "#);
+            assert_eq!(
+                CommodityFlags::STYLE_SUFFIXED
+                    | CommodityFlags::STYLE_SEPARATED
+                    | CommodityFlags::STYLE_DECIMAL_COMMA,
+                amount.commodity().unwrap().flags()
+            );
+        }
     }
 
     #[test]
     fn test_parse_posting() {
+        init();
+
         let (_, posting) = parse_posting("A  $12").unwrap();
         assert_eq!(posting.account_name(), "A".to_string());
         insta::assert_debug_snapshot!(posting.amount.unwrap(), @r#"
             AMOUNT($12) [prec:0, keep:false, comm:$, raw:12]
         "#);
 
+        reset_parse_state();
         let (_, posting) = parse_posting("A\t$12").unwrap();
         assert_eq!(posting.account_name(), "A".to_string());
         insta::assert_debug_snapshot!(posting.amount.unwrap(), @r#"
             AMOUNT($12) [prec:0, keep:false, comm:$, raw:12]
         "#);
 
+        reset_parse_state();
         // not enough spaces between account and price
         let (_, posting) = parse_posting("A $12").unwrap();
         assert_eq!(posting.account_name(), "A $12".to_string());
         assert!(posting.amount.is_none());
 
+        reset_parse_state();
         let (_, posting) = parse_posting("A  12 USD").unwrap();
         assert_eq!(posting.account_name(), "A".to_string());
         insta::assert_debug_snapshot!(posting.amount.unwrap(), @r#"
             AMOUNT(12 USD) [prec:0, keep:false, comm:USD, raw:12]
         "#);
 
+        reset_parse_state();
         let (_, posting) = parse_posting("A  3 @ $4").unwrap();
         insta::assert_debug_snapshot!(posting.amount.unwrap(), @r#"
             AMOUNT(3) [prec:0, keep:false, raw:3]
@@ -2283,6 +2872,7 @@ mod tests {
         "#);
         assert_eq!(posting.cost, posting.given_cost);
 
+        reset_parse_state();
         let (_, posting) = parse_posting("A  6@@$12").unwrap();
         insta::assert_debug_snapshot!(posting.amount.unwrap(), @r#"
             AMOUNT(6) [prec:0, keep:false, raw:6]
@@ -2300,6 +2890,7 @@ mod tests {
         // TODO: qty and cost different commodities, but only if price not included
         // TODO: virtual cost
 
+        reset_parse_state();
         let (_, posting) = parse_posting("A  3 {$2} @ $4").unwrap();
         insta::assert_debug_snapshot!(posting.amount.as_ref().unwrap(), @r#"
             AMOUNT(3) [prec:0, keep:false, comm:, raw:3]
@@ -2315,6 +2906,7 @@ mod tests {
             )
         "#);
 
+        reset_parse_state();
         let (_, posting) = parse_posting("A  $1.20 {{£5.00}} @@6.00£").unwrap();
         // AMOUNT($1.20) [prec:2, keep:false, comm:$, raw:1.20]
         // amount, as given
@@ -2324,16 +2916,17 @@ mod tests {
         // price should be 5/1.2
         insta::assert_debug_snapshot!(posting.amount.unwrap().commodity().unwrap().annotation().price(), @r#"
             Some(
-                AMOUNT(£4.16666667) [prec:8, keep:false, comm:£, raw:25/6],
+                AMOUNT(£4.1666667) [prec:7, keep:false, comm:£, raw:25/6],
             )
         "#);
         // cost should be 6/1.2
         insta::assert_debug_snapshot!(posting.cost, @r#"
             Some(
-                AMOUNT(5.00000000£) [prec:8, keep:false, comm:£, raw:5],
+                AMOUNT(5.0000000£) [prec:7, keep:false, comm:£, raw:5],
             )
         "#);
 
+        reset_parse_state();
         let (_, posting) = parse_posting("Actif:SV  -0,0415 MFE @ 358,80 €").unwrap();
         insta::assert_debug_snapshot!(posting.amount.as_ref().unwrap(), @r#"
             AMOUNT(-0.0415 MFE) [prec:4, keep:false, comm:MFE, raw:-83/2000]
@@ -2343,7 +2936,7 @@ mod tests {
         "#);
         insta::assert_debug_snapshot!(posting.cost, @r#"
             Some(
-                AMOUNT(358.80 €) [prec:2, keep:false, comm:€, raw:1794/5],
+                AMOUNT(358.8 €) [prec:1, keep:false, comm:€, raw:1794/5],
             )
         "#);
         assert_eq!(

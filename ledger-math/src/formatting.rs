@@ -9,6 +9,7 @@ use std::sync::Arc;
 use num_bigint::BigInt;
 use num_rational::BigRational;
 use num_traits::{Signed, Zero};
+use unicode_width::UnicodeWidthStr;
 
 use crate::amount::{Amount, Precision};
 use crate::balance::Balance;
@@ -51,6 +52,9 @@ pub struct FormatConfig {
     /// Display precision override (None uses commodity/amount precision)
     pub precision: Option<Precision>,
 
+    /// Should precision be reduced, where possible? For example, printing $1.00 as $1.
+    pub reduce_precision: bool,
+
     /// Minimum width for output
     pub min_width: Option<usize>,
 
@@ -92,6 +96,11 @@ impl FormatConfig {
 
     pub fn with_precision(mut self, precision: Precision) -> Self {
         self.precision = Some(precision);
+        self
+    }
+
+    pub fn reducing_precision(mut self) -> Self {
+        self.reduce_precision = true;
         self
     }
 
@@ -221,7 +230,7 @@ fn format_integer_with_separators(
     for (i, &ch) in chars.iter().enumerate() {
         result.push(ch);
         let remaining = chars.len() - i - 1;
-        if remaining > 0 && remaining % 3 == 0 {
+        if remaining > 0 && remaining.is_multiple_of(3) {
             result.push_str(separator);
         }
     }
@@ -242,7 +251,7 @@ pub fn apply_width_formatting(text: &str, config: &FormatConfig) -> String {
 
     // First truncate if max_width is specified
     let mut result = if let Some(max_w) = max_width {
-        if text.len() > max_w {
+        if text.width() > max_w {
             if max_w > 3 {
                 format!("{}...", &text[..max_w - 3])
             } else if max_w > 0 {
@@ -258,8 +267,8 @@ pub fn apply_width_formatting(text: &str, config: &FormatConfig) -> String {
     };
 
     // Then apply minimum width padding
-    if result.len() < min_width {
-        let padding = min_width - result.len();
+    if result.width() < min_width {
+        let padding = min_width - result.width();
         if config.flags.has_flag(FormatFlags::RIGHT_JUSTIFY) {
             result = format!("{}{}", " ".repeat(padding), result);
         } else {
@@ -279,10 +288,19 @@ pub fn format_amount(amount: &Amount, config: &FormatConfig) -> String {
     let precision = config.precision.unwrap_or_else(|| amount.display_precision());
 
     let quantity_str = if let Some(rational) = amount.to_rational() {
-        format_rational(rational, precision, config, amount.commodity())
+        let quantity_str = format_rational(rational, precision, config, amount.commodity());
+        if config.reduce_precision {
+            // dbg!(&quantity_str);
+            // quantity_str.trim_end_matches('0').trim_end_matches([',', '.']).to_string()
+            quantity_str
+        } else {
+            quantity_str
+        }
     } else {
         "0".to_string()
     };
+
+    // dbg!(&quantity_str);
 
     // Add commodity formatting
     let formatted = if let Some(commodity_ref) = amount.commodity() {

@@ -439,6 +439,8 @@ impl Transaction {
         writer: &mut impl std::io::Write,
         journal_commodities: &HashMap<String, Arc<Commodity>>,
     ) -> Result<(), std::io::Error> {
+        // dbg!(journal_commodities);
+
         let status = match self.status {
             TransactionStatus::Uncleared => "",
             TransactionStatus::Cleared => " *",
@@ -457,7 +459,7 @@ impl Transaction {
             .unwrap_or(0);
 
         for posting in postings {
-            posting.write(writer, longest_account_name, &journal_commodities)?;
+            posting.write(writer, longest_account_name, journal_commodities)?;
             writeln!(writer)?;
         }
 
