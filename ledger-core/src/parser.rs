@@ -432,70 +432,9 @@ impl JournalParser {
 
             // Ensure the account exists in the journal
             // This will create it if it doesn't exist
-            let _ = journal.get_or_create_account(&account_name);
-
-            // Register commodity from the amount if present
-            // if let Some(amount) = &posting.amount {
-            //     self.register_commodity_for_amount(amount, journal);
-            //     if let Some(price) =
-            //         amount.commodity().and_then(|c| c.annotation().price().as_ref())
-            //     {
-            //         self.register_commodity_for_amount(price, journal);
-            //     }
-            // }
-            // if let Some(cost) = &posting.given_cost {
-            //     self.register_commodity_for_amount(cost, journal);
-            //     // NOTE: technically, the commodity of a cost could have a
-            //     // price, but I don't believe it ever does in practice
-            // }
+            journal.get_or_create_account(&account_name);
         }
     }
-
-    // fn register_commodity_for_amount(&mut self, amount: &Amount, journal: &mut Journal) {
-    //     if let Some(commodity_ref) = amount.commodity() {
-    //         let new_commodity = commodity_ref.clone();
-    //         let symbol = new_commodity.symbol().to_string();
-
-    //         // Add commodity if it doesn't exist in the journal
-    //         if let Some(previous_commodity) = journal.commodities.get(&symbol) {
-    //             if previous_commodity.precision() < new_commodity.precision()
-    //                 || previous_commodity.flags() != new_commodity.flags()
-    //                 || previous_commodity.annotation() != new_commodity.annotation()
-    //             {
-    //                 // FIXME: this seems messy
-    //                 let mut new_commodity = Arc::unwrap_or_clone(new_commodity);
-
-    //                 if new_commodity.precision() < previous_commodity.precision() {
-    //                     new_commodity.set_precision(previous_commodity.precision());
-    //                 }
-    //                 new_commodity.add_flags(previous_commodity.flags());
-
-    //                 match (
-    //                     new_commodity.annotation().price(),
-    //                     previous_commodity.annotation().price(),
-    //                 ) {
-    //                     (Some(new_commodity_price), Some(previous_commodity_price))
-    //                         if new_commodity_price < previous_commodity_price =>
-    //                     {
-    //                         new_commodity
-    //                             .annotation_mut()
-    //                             .set_price(previous_commodity_price.clone());
-    //                     }
-    //                     (None, Some(previous_commodity_price)) => {
-    //                         new_commodity
-    //                             .annotation_mut()
-    //                             .set_price(previous_commodity_price.clone());
-    //                     }
-    //                     (Some(_), Some(_)) | (Some(_), None) | (None, None) => {}
-    //                 }
-
-    //                 journal.commodities.insert(symbol.clone(), Arc::new(new_commodity));
-    //             }
-    //         } else {
-    //             journal.commodities.insert(symbol.clone(), new_commodity.clone());
-    //         }
-    //     }
-    // }
 
     /// Process a parsed directive with include handling. Happens after entire
     /// journal is parsed. For processing directives during parse, see
