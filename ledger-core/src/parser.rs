@@ -1101,7 +1101,8 @@ fn journal_entry(input: &str) -> ParseResult<'_, JournalEntry> {
     alt((
         map(transaction_entry, JournalEntry::Transaction),
         map(directive_entry, JournalEntry::Directive),
-        map(enhanced_comment_line, |(comment, metadata)| {
+        map(comment, |comment| {
+            let metadata = parse_metadata_tags(&comment, None);
             if metadata.is_empty() {
                 JournalEntry::Comment(comment)
             } else {
@@ -1115,14 +1116,6 @@ fn journal_entry(input: &str) -> ParseResult<'_, JournalEntry> {
 /// Parse an empty line
 fn empty_line(input: &str) -> ParseResult<'_, &str> {
     terminated(space0, line_ending)(input)
-}
-
-/// Parse a comment line with optional metadata extraction
-#[allow(dead_code)]
-fn comment_line(input: &str) -> ParseResult<'_, String> {
-    map(preceded(alt((tag(";"), tag("#"), tag("*"), tag("|"))), take_until("\n")), |s: &str| {
-        s.to_string()
-    })(input)
 }
 
 /// Parse metadata tags from comments with multiple supported patterns
@@ -1209,12 +1202,10 @@ fn parse_metadata_tags(
     metadata
 }
 
-/// Enhanced comment parser with metadata extraction
-fn enhanced_comment_line(input: &str) -> ParseResult<'_, (String, HashMap<String, String>)> {
+/// Parse a comment
+fn comment(input: &str) -> ParseResult<'_, String> {
     map(preceded(alt((tag(";"), tag("#"), tag("*"), tag("|"))), take_until("\n")), |s: &str| {
-        let comment = s.to_string();
-        let metadata = parse_metadata_tags(&comment, None);
-        (comment, metadata)
+        s.trim().to_string()
     })(input)
 }
 
@@ -1240,10 +1231,10 @@ fn parse_transaction(input: &str) -> ParseResult<'_, Transaction> {
         opt(payee_description),
         space0,
         // transaction comment on payee line
-        opt(simple_comment_field),
+        opt(comment),
         line_ending,
         // transaction comments between payees and postings
-        many0(delimited(alt((space1, tag("\t"))), simple_comment_field, line_ending)),
+        many0(delimited(alt((space1, tag("\t"))), comment, line_ending)),
         many0(posting_line),
     ));
 
@@ -1363,7 +1354,7 @@ pub(crate) fn parse_posting(input: &str) -> ParseResult<'_, Posting> {
                 amount_with_minimum_precision,
             )),
         ))),
-        opt(preceded(space0, simple_comment_field)),
+        opt(preceded(space0, comment)),
         opt(line_ending),
     ));
 
@@ -1870,21 +1861,6 @@ fn amount_field_impl(input: &str, options: AmountFieldOptions) -> ParseResult<'_
     Ok((rest, amount))
 }
 
-/// Parse a comment field with metadata extraction
-#[allow(dead_code)]
-fn comment_field(input: &str) -> ParseResult<'_, (String, HashMap<String, String>)> {
-    map(preceded(tag(";"), take_until("\n")), |s: &str| {
-        let comment = s.trim().to_string();
-        let metadata = parse_metadata_tags(&comment, None);
-        (comment, metadata)
-    })(input)
-}
-
-/// Simple comment field parser (for backward compatibility)
-fn simple_comment_field(input: &str) -> ParseResult<'_, String> {
-    map(preceded(tag(";"), take_until("\n")), |s: &str| s.trim().to_string())(input)
-}
-
 // ============================================================================
 // Directive Parsing
 // ============================================================================
@@ -2224,15 +2200,6 @@ mod tests {
     }
 
     #[test]
-    fn test_comment_line() {
-        let input = "; This is a comment\n";
-        let result = comment_line(input);
-        assert!(result.is_ok());
-        let (_, comment) = result.unwrap();
-        assert_eq!(comment, " This is a comment");
-    }
-
-    #[test]
     fn test_account_name() {
         let (_, name) = account_name("Assets:Checking").unwrap();
         assert_eq!(name, "Assets:Checking");
@@ -2284,13 +2251,12 @@ mod tests {
     }
 
     #[test]
-    fn test_enhanced_comment_line() {
+    fn test_comment_line() {
         let input = "; This is a comment :Receipt: 12345\n";
-        let result = enhanced_comment_line(input);
+        let result = comment(input);
         assert!(result.is_ok());
-        let (_, (comment, metadata)) = result.unwrap();
-        assert_eq!(comment, " This is a comment :Receipt: 12345");
-        assert_eq!(metadata.get("Receipt"), Some(&"12345".to_string()));
+        let (_, comment) = result.unwrap();
+        assert_eq!(comment, "This is a comment :Receipt: 12345");
     }
 
     #[test]
