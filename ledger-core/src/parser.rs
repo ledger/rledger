@@ -12,7 +12,7 @@ use ledger_math::{commodity::Precision, Annotation, CommodityFlags, CommodityPoo
 use log::debug;
 use nom::{
     branch::alt,
-    bytes::complete::{is_not, take_until, take_while_m_n},
+    bytes::complete::{is_a, is_not, take_until, take_while_m_n},
     character::complete::{char, digit1, line_ending, space0, space1},
     combinator::{consumed, map, not, opt, success, value, verify},
     error::{context, ParseError},
@@ -1204,9 +1204,7 @@ fn parse_metadata_tags(
 
 /// Parse a comment
 fn comment(input: &str) -> ParseResult<'_, String> {
-    map(preceded(alt((tag(";"), tag("#"), tag("*"), tag("|"))), take_until("\n")), |s: &str| {
-        s.trim().to_string()
-    })(input)
+    map(preceded(is_a(";#*|"), take_until("\n")), |s: &str| s.trim().to_string())(input)
 }
 
 // ============================================================================
