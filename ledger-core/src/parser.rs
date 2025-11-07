@@ -24,14 +24,14 @@ use nom::{
 
 // We need to use bytes for tag with byte strings
 
-use std::cell::RefCell;
-use std::collections::HashMap;
 use std::fs::File;
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::str::FromStr;
 use std::sync::Arc;
+use std::{cell::RefCell, fmt::Display};
+use std::{collections::HashMap, fmt::Pointer};
 
 use crate::{
     account::{Account, AccountRef},
@@ -50,7 +50,7 @@ use rust_decimal::Decimal;
 pub enum JournalParseError {
     #[error("Parse error in {filename} at line {line}, column {column}: {message}")]
     ParseError {
-        filename: PathBuf,
+        filename: ParseInput,
         line: usize,
         column: usize,
         message: String,
@@ -69,14 +69,14 @@ pub enum JournalParseError {
     },
     #[error("Transaction validation error in {filename} at line {line}: {message}")]
     ValidationError {
-        filename: PathBuf,
+        filename: ParseInput,
         line: usize,
         message: String,
         transaction_description: String,
     },
     #[error("Unbalanced transaction in {filename} at line {line}: {message}\nTransaction: {description}\nDifference: {difference}")]
     UnbalancedTransaction {
-        filename: PathBuf,
+        filename: ParseInput,
         line: usize,
         description: String,
         message: String,
@@ -113,11 +113,27 @@ pub fn reset_parse_state() {
     PARSE_STATE.with_borrow_mut(|c| c.commodity_pool = CommodityPool::new());
 }
 
+/// What sort of input has been provided to the parser.
+#[derive(Debug, Clone)]
+pub enum ParseInput {
+    File(PathBuf),
+    StdIn,
+}
+
+impl Display for ParseInput {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ParseInput::File(path_buf) => path_buf.fmt(f),
+            ParseInput::StdIn => write!(f, "<input>"),
+        }
+    }
+}
+
 /// Parser state structure for context management
 #[derive(Debug, Clone)]
 pub struct ParseContext {
     /// Current file being parsed
-    pub filename: PathBuf,
+    pub filename: ParseInput,
     /// Current line number
     pub line: usize,
     /// Current column number
@@ -156,7 +172,7 @@ impl ParseContext {
 impl Default for ParseContext {
     fn default() -> Self {
         ParseContext {
-            filename: PathBuf::from("<input>"),
+            filename: ParseInput::StdIn,
             line: 1,
             column: 1,
             include_stack: Vec::new(),
@@ -323,7 +339,7 @@ impl JournalParser {
     /// Create a parser with specified filename
     pub fn with_file<P: AsRef<Path>>(filename: P) -> Self {
         let mut parser = Self::new();
-        parser.context.filename = filename.as_ref().to_path_buf();
+        parser.context.filename = ParseInput::File(filename.as_ref().to_path_buf());
         parser
     }
 
@@ -345,7 +361,7 @@ impl JournalParser {
 
         // Update context
         let old_filename = self.context.filename.clone();
-        self.context.filename = path_buf.clone();
+        self.context.filename = ParseInput::File(path_buf.clone());
         self.context.include_stack.push(path_buf);
 
         // Parse the file
@@ -551,7 +567,13 @@ impl JournalParser {
         let include_path = if path.is_absolute() {
             path.clone()
         } else {
-            self.context.filename.parent().unwrap_or_else(|| Path::new("")).join(path)
+            match self.context.filename {
+                ParseInput::File(ref path_buf) => {
+                    path_buf.parent().unwrap_or_else(|| Path::new("")).join(path)
+                }
+                // FIXME: probably use cwd
+                ParseInput::StdIn => path.clone(),
+            }
         };
 
         // Parse included file and merge
@@ -576,7 +598,13 @@ impl JournalParser {
             let resolved_path = if path.is_absolute() {
                 path
             } else {
-                self.context.filename.parent().unwrap_or_else(|| Path::new("")).join(&path)
+                match self.context.filename {
+                    ParseInput::File(ref path_buf) => {
+                        path_buf.parent().unwrap_or_else(|| Path::new("")).join(path)
+                    }
+                    // FIXME: probably use cwd
+                    ParseInput::StdIn => path,
+                }
             };
 
             return resolved_path.exists();
