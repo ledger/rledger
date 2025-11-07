@@ -8,6 +8,7 @@
 //! - Include file resolution with cycle detection
 //! - Streaming parser for large files
 
+use compact_str::CompactString;
 use ledger_math::{commodity::Precision, Annotation, CommodityFlags, CommodityPool};
 use log::debug;
 use nom::{
@@ -33,7 +34,7 @@ use std::str::FromStr;
 use std::sync::Arc;
 
 use crate::{
-    account::Account,
+    account::{Account, AccountRef},
     amount::Amount,
     commodity::Commodity,
     journal::Journal,
@@ -129,12 +130,27 @@ pub struct ParseContext {
     pub current_year: Option<i32>,
     /// Default account for unbalanced postings
     pub default_account: Option<String>,
+    /// Account registry
+    pub accounts: HashMap<String, AccountRef>,
     /// Commodity pool
     pub commodity_pool: CommodityPool,
     /// Commodity aliases
     pub commodity_aliases: HashMap<String, String>,
     /// Account aliases
     pub account_aliases: HashMap<String, String>,
+}
+
+impl ParseContext {
+    /// Find or create an account by name
+    pub fn find_or_create_account(&mut self, name: &str) -> AccountRef {
+        if let Some(account) = self.accounts.get(name) {
+            account.clone()
+        } else {
+            let account = Rc::new(RefCell::new(Account::new(CompactString::from(name), None, 0)));
+            self.accounts.insert(name.to_string(), account.clone());
+            account
+        }
+    }
 }
 
 impl Default for ParseContext {
@@ -146,6 +162,7 @@ impl Default for ParseContext {
             include_stack: Vec::new(),
             apply_stack: Vec::new(),
             current_year: None,
+            accounts: HashMap::new(),
             default_account: None,
             commodity_pool: CommodityPool::new(),
             commodity_aliases: HashMap::new(),
@@ -384,6 +401,7 @@ impl JournalParser {
     /// Build journal from parsed entries
     fn build_journal(&mut self, entries: Vec<JournalEntry>) -> Result<Journal, JournalParseError> {
         let mut journal = Journal::new();
+        journal.accounts = self.context.accounts.clone();
         journal.commodity_pool = self.context.commodity_pool.clone();
 
         for entry in entries {
@@ -445,8 +463,7 @@ impl JournalParser {
         directive: Directive,
     ) -> Result<(), JournalParseError> {
         match directive {
-            Directive::Account { name, declarations } => {
-                let account = Account::new(name.clone().into(), None, 0);
+            Directive::Account { name: _, declarations } => {
                 for decl in declarations {
                     match decl {
                         AccountDeclaration::Alias(_alias) => {
@@ -460,7 +477,6 @@ impl JournalParser {
                     }
                 }
                 // TODO: error logging
-                let _ = journal.add_account(Rc::new(RefCell::new(account)));
             }
             Directive::Commodity { symbol, declarations } => {
                 let mut commodity = Commodity::new(&symbol);
@@ -1297,14 +1313,9 @@ pub(crate) fn parse_posting(input: &str) -> ParseResult<'_, Posting> {
 
     let (rest, (account, amount_price_cost, comment, _)) = parser(input)?;
 
-    // Create a dummy account reference for now
     // TODO: Proper account management
-    use compact_str::CompactString;
-    let account_ref = std::rc::Rc::new(std::cell::RefCell::new(crate::account::Account::new(
-        CompactString::from(account),
-        None,
-        0,
-    )));
+    let account_ref = PARSE_STATE.with_borrow_mut(|state| state.find_or_create_account(&account));
+
     let mut posting = Posting::new(account_ref);
 
     if let Some((mut amount, lot_price, cost)) = amount_price_cost {
@@ -2741,6 +2752,11 @@ mod tests {
         assert_eq!(posting.account_name(), "A".to_string());
         insta::assert_debug_snapshot!(posting.amount.unwrap(), @r#"
             AMOUNT($12) [prec:0, keep:false, comm:$, raw:12]
+        "#);
+        insta::assert_debug_snapshot!(PARSE_STATE.take().accounts.keys(), @r#"
+           [
+               "A",
+           ]
         "#);
 
         reset_parse_state();
