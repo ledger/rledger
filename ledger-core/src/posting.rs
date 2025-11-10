@@ -481,7 +481,7 @@ mod tests {
     #[test]
     fn test_parse_and_format_posting() {
         let (_, posting) =
-            parse_posting("Actif:BC                               -340,00 €").unwrap();
+            parse_posting("Actif:BC                               -340,00 €".into()).unwrap();
         insta::assert_snapshot!(
             posting.format(0, &HashMap::default()),
             @r#"    Actif:BC                               -340,00 €"#
@@ -490,7 +490,8 @@ mod tests {
 
     #[test]
     fn test_parse_and_format_posting_with_extra_precision() {
-        let (_, posting) = parse_posting("Actif:SSB                       125,0000   STK").unwrap();
+        let (_, posting) =
+            parse_posting("Actif:SSB                       125,0000   STK".into()).unwrap();
         insta::assert_snapshot!(
             posting.format(0, &HashMap::default()),
             @r#"    Actif:SSB                           125,0000 STK"#
@@ -500,7 +501,8 @@ mod tests {
     #[test]
     fn test_parse_and_format_posting_with_cost() {
         let (_, posting) =
-            parse_posting("Actif:SV                              1,0204 MFE @ 333,20 €").unwrap();
+            parse_posting("Actif:SV                              1,0204 MFE @ 333,20 €".into())
+                .unwrap();
         insta::assert_snapshot!(
             posting.format(0, &HashMap::default()),
             @r#"    Actif:SV                              1,0204 MFE @ 333,2 €"#

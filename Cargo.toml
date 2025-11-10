@@ -39,6 +39,7 @@ bitflags = "2.4"
 
 # Parsing dependencies
 nom = "7.1"
+nom_locate = "4.2"
 
 # Testing dependencies
 insta = "1.43.2"
