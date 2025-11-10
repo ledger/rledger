@@ -1548,9 +1548,9 @@ pub(crate) fn parse_posting(input: &str) -> ParseResult<'_, Posting> {
 
     // TODO: confirm that amount.commodity != given_cost.commodity
 
-    if let Some(comment) = comment {
-        use compact_str::CompactString;
+    if let Some(ref comment) = comment {
         posting.note = Some(CompactString::from(comment));
+        posting.metadata = parse_metadata_tags(comment, None);
     }
 
     Ok((rest, posting))
@@ -3124,6 +3124,53 @@ mod tests {
                 | CommodityFlags::STYLE_DECIMAL_COMMA,
             posting.amount.unwrap().commodity().unwrap().flags()
         );
+    }
+
+    #[test]
+    fn test_parse_posting_tags() {
+        init();
+
+        let (_, posting) = parse_posting("A  1 ; not tag\n").unwrap();
+        insta::assert_debug_snapshot!(posting.note, @r#"
+            Some(
+                "not tag",
+            )
+        "#);
+        insta::assert_debug_snapshot!(posting.metadata, @r#"
+            {}
+        "#);
+
+        let (_, posting) = parse_posting("A  1 ; :tag:\n").unwrap();
+        insta::assert_debug_snapshot!(posting.note, @r#"
+            Some(
+                ":tag:",
+            )
+        "#);
+        insta::assert_debug_snapshot!(posting.metadata, @r#"
+            {
+                "tag": TagData {
+                    value: None,
+                    inherited: false,
+                },
+            }
+        "#);
+
+        let (_, posting) = parse_posting("A  1 ; tag: value\n").unwrap();
+        insta::assert_debug_snapshot!(posting.note, @r#"
+            Some(
+                "tag: value",
+            )
+        "#);
+        insta::assert_debug_snapshot!(posting.metadata, @r#"
+            {
+                "tag": TagData {
+                    value: Some(
+                        "value",
+                    ),
+                    inherited: false,
+                },
+            }
+        "#);
     }
 
     #[test]
