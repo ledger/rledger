@@ -13,10 +13,10 @@ use ledger_math::{commodity::Precision, Annotation, CommodityFlags, CommodityPoo
 use log::debug;
 use nom::{
     branch::alt,
-    bytes::complete::{is_a, is_not, take_until, take_while_m_n},
+    bytes::complete::{is_a, is_not, tag, take_until, take_while_m_n},
     character::complete::{char, digit1, line_ending, space0, space1},
     combinator::{consumed, map, not, opt, success, value, verify},
-    error::{context, ParseError},
+    error::{context, ParseError, VerboseError},
     multi::{many0, many1, many_m_n},
     sequence::{delimited, pair, preceded, terminated, tuple},
     AsChar, IResult,
@@ -105,22 +105,8 @@ pub enum JournalParseError {
     UnknownTag { filename: ParseInput, line: usize, tag: String },
 }
 
-/// Custom error type for detailed error reporting
-pub type VerboseError<I> = nom::error::VerboseError<I>;
-
 /// Result type for parsing operations
 type ParseResult<'a, T> = IResult<&'a str, T, VerboseError<&'a str>>;
-
-// Helper function for string tags that works with VerboseError
-fn tag<'a>(s: &'a str) -> impl Fn(&'a str) -> ParseResult<'a, &'a str> + 'a {
-    move |input: &'a str| {
-        if let Some(stripped) = input.strip_prefix(s) {
-            Ok((stripped, s))
-        } else {
-            Err(nom::Err::Error(VerboseError::from_error_kind(input, nom::error::ErrorKind::Tag)))
-        }
-    }
-}
 
 // thread_local! allows shared global state during parse while still allowing us
 // to run tests in parallel. Won't work if parsing is ever multithreaded.
@@ -1434,17 +1420,17 @@ fn parse_transaction(input: &str) -> ParseResult<'_, Transaction> {
 fn date_field(input: &str) -> ParseResult<'_, NaiveDate> {
     let date_with_optional_year = |sep| {
         tuple((
-            opt(terminated(verify(digit1, |s: &str| s.len() == 4), tag(sep))),
-            terminated(verify(digit1, |s: &str| (1..=2).contains(&s.len())), tag(sep)),
-            terminated(verify(digit1, |s: &str| (1..=2).contains(&s.len())), not(tag(sep))),
+            opt(terminated(verify(digit1::<&str, _>, |s: &str| s.len() == 4), char(sep))),
+            terminated(verify(digit1, |s: &str| (1..=2).contains(&s.len())), char(sep)),
+            terminated(verify(digit1, |s: &str| (1..=2).contains(&s.len())), not(char(sep))),
         ))
     };
 
     map(
         alt((
-            date_with_optional_year("/"),
-            date_with_optional_year("-"),
-            date_with_optional_year("."),
+            date_with_optional_year('/'),
+            date_with_optional_year('-'),
+            date_with_optional_year('.'),
         )),
         |(year, month, day)| {
             let default_year = PARSE_STATE
@@ -2158,7 +2144,7 @@ fn conditional_include_directive(input: &str) -> ParseResult<'_, Directive> {
     map(
         tuple((
             tag("include"),
-            space1,
+            space1::<&str, _>,
             delimited(tag("["), take_until("]"), tag("]")),
             space1,
             take_until("\n"),
@@ -2185,7 +2171,7 @@ fn price_directive(input: &str) -> ParseResult<'_, Directive> {
 /// Parse alias directive
 fn alias_directive(input: &str) -> ParseResult<'_, Directive> {
     map(
-        tuple((tag("alias"), space1, take_until("="), tag("="), take_until("\n"))),
+        tuple((tag("alias"), space1::<&str, _>, take_until("="), tag("="), take_until("\n"))),
         |(_, _, account, _, alias)| Directive::Alias {
             account: account.trim().to_string(),
             alias: alias.trim().to_string(),
@@ -2241,7 +2227,7 @@ fn tag_directive(input: &str) -> ParseResult<'_, Directive> {
 /// Parse option directive
 fn option_directive(input: &str) -> ParseResult<'_, Directive> {
     map(
-        tuple((tag("option"), space1, take_until(" "), space1, take_until("\n"))),
+        tuple((tag("option"), space1::<&str, _>, take_until(" "), space1, take_until("\n"))),
         |(_, _, name, _, value)| Directive::Option {
             name: name.trim().to_string(),
             value: value.trim().to_string(),
@@ -2259,7 +2245,7 @@ fn eval_directive(input: &str) -> ParseResult<'_, Directive> {
 /// Parse define directive
 fn define_directive(input: &str) -> ParseResult<'_, Directive> {
     map(
-        tuple((tag("define"), space1, take_until("="), tag("="), take_until("\n"))),
+        tuple((tag("define"), space1::<&str, _>, take_until("="), tag("="), take_until("\n"))),
         |(_, _, name, _, expression)| Directive::Define {
             name: name.trim().to_string(),
             expression: expression.trim().to_string(),
