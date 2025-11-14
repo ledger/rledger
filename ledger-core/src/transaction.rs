@@ -1,5 +1,6 @@
 //! Transaction representation
 
+use crate::parser::JournalLocation;
 use crate::posting::{Posting, PostingFlags};
 use chrono::NaiveDate;
 use ledger_math::amount::Amount;
@@ -78,6 +79,9 @@ impl TagData {
 /// Represents a transaction (xact in C++)
 #[derive(Debug, Clone)]
 pub struct Transaction {
+    /// TODO:
+    pub location: JournalLocation,
+
     /// Transaction date
     pub date: NaiveDate,
     /// Optional auxiliary/effective date
@@ -113,6 +117,7 @@ impl Default for TransactionFlags {
 impl Default for Transaction {
     fn default() -> Self {
         Transaction {
+            location: JournalLocation::None,
             date: chrono::Local::now().date_naive(),
             aux_date: None,
             status: TransactionStatus::Uncleared,
@@ -133,6 +138,7 @@ impl Transaction {
     /// Create a new transaction with required fields
     pub fn new(date: NaiveDate, payee: String) -> Self {
         Self {
+            location: JournalLocation::None,
             date,
             aux_date: None,
             status: TransactionStatus::default(),
@@ -146,6 +152,12 @@ impl Transaction {
             metadata: HashMap::new(),
             sequence: 0,
         }
+    }
+
+    /// Set the location for this transaction.
+    pub fn at_location(mut self, location: JournalLocation) -> Self {
+        self.location = location;
+        self
     }
 
     /// Add a posting to this transaction
@@ -634,6 +646,8 @@ impl TransactionBuilder {
     /// Build the transaction, performing validation
     pub fn build(self) -> Result<Transaction, String> {
         let mut transaction = Transaction {
+            // FIXME:
+            location: JournalLocation::None,
             date: self.date,
             aux_date: self.aux_date,
             status: self.status,
@@ -656,6 +670,8 @@ impl TransactionBuilder {
     /// Build the transaction without validation (useful for incomplete transactions)
     pub fn build_unchecked(self) -> Transaction {
         Transaction {
+            // FIXME:
+            location: JournalLocation::None,
             date: self.date,
             aux_date: self.aux_date,
             status: self.status,
@@ -674,6 +690,8 @@ impl TransactionBuilder {
     /// Try to auto-balance and get validation errors without building
     pub fn validate(&mut self) -> Result<(), String> {
         let mut temp_transaction = Transaction {
+            // FIXME:
+            location: JournalLocation::None,
             date: self.date,
             aux_date: self.aux_date,
             status: self.status,
@@ -704,6 +722,8 @@ impl TransactionBuilder {
     /// Check if transaction would balance
     pub fn is_balanced(&self) -> bool {
         let temp_transaction = Transaction {
+            // FIXME:
+            location: JournalLocation::None,
             date: self.date,
             aux_date: self.aux_date,
             status: self.status,
@@ -871,6 +891,8 @@ impl Transaction {
             self.postings.iter().filter(|p| p.is_virtual()).cloned().collect();
 
         Transaction {
+            // FIXME:
+            location: JournalLocation::None,
             date: self.date,
             aux_date: self.aux_date,
             status: self.status,
@@ -892,6 +914,8 @@ impl Transaction {
             self.postings.iter().filter(|p| p.must_balance()).cloned().collect();
 
         Transaction {
+            // FIXME:
+            location: JournalLocation::None,
             date: self.date,
             aux_date: self.aux_date,
             status: self.status,

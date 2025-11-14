@@ -19,7 +19,7 @@ use nom::{
     error::{context, ParseError, VerboseError},
     multi::{many0, many1, many_m_n},
     sequence::{delimited, pair, preceded, terminated, tuple},
-    AsChar, IResult,
+    AsChar, IResult, Slice,
 };
 use nom_locate::LocatedSpan;
 
@@ -91,9 +91,15 @@ pub enum JournalParseError {
     UnknownAccount { filename: ParseInput, line: usize, posting: String, account: String },
 
     #[error(
-        "While parsing file \"{filename}\", line {line}:\nWhile parsing posting:\n{posting}\nError: Unknown commodity '{commodity}'"
+        "While parsing file \"{filename}\", line {line}:\nWhile parsing posting:\n{posting}\n{highlight}\nError: Unknown commodity '{commodity}'"
     )]
-    UnknownCommodity { filename: ParseInput, line: usize, posting: String, commodity: String },
+    UnknownCommodity {
+        filename: ParseInput,
+        line: usize,
+        posting: String,
+        highlight: String,
+        commodity: String,
+    },
 
     #[error(
         "While parsing file \"{filename}\", line {line}:\nWhile parsing transaction:\n{description}\nError: Unknown payee '{payee}'"
@@ -140,6 +146,29 @@ impl Display for ParseInput {
                 path_buf.canonicalize().expect("canonicalizing input path").display()
             ),
             ParseInput::StdIn => write!(f, "<input>"),
+        }
+    }
+}
+
+/// A location within a journal file.
+#[derive(Debug, Clone)]
+pub enum JournalLocation {
+    /// Location with filename and line.
+    FileAndLine { filename: ParseInput, line: usize },
+
+    /// Location with line only; filename can be inferred from the containing entry.
+    Line(usize),
+
+    /// No location. eg Virtual and Automatic transactions
+    None,
+}
+
+impl JournalLocation {
+    // FIXME: should be Option?
+    pub fn line(&self) -> usize {
+        match self {
+            JournalLocation::FileAndLine { line, .. } | JournalLocation::Line(line) => *line,
+            JournalLocation::None => 0,
         }
     }
 }
@@ -467,7 +496,7 @@ impl JournalParser {
             self.context = PARSE_STATE.with_borrow_mut(|c| c.clone());
             entries
         };
-        let journal = self.build_journal(entries)?;
+        let journal = self.build_journal(entries, input)?;
         Ok(journal)
     }
 
@@ -501,7 +530,11 @@ impl JournalParser {
     }
 
     /// Build journal from parsed entries
-    fn build_journal(&mut self, entries: Vec<JournalEntry>) -> Result<Journal, JournalParseError> {
+    fn build_journal(
+        &mut self,
+        entries: Vec<JournalEntry>,
+        input: &str,
+    ) -> Result<Journal, JournalParseError> {
         let mut journal = Journal::new();
         journal.accounts = self.context.accounts.clone();
         journal.commodity_pool = self.context.commodity_pool.clone();
@@ -514,7 +547,7 @@ impl JournalParser {
                     self.register_transaction_accounts_and_commodities(&mut journal, &transaction);
 
                     // Validate transaction before adding
-                    match self.validate_transaction(&transaction) {
+                    match self.validate_transaction(&transaction, input) {
                         Ok(_) => journal.add_transaction(transaction),
                         Err(validation_error) => {
                             any_error = self.config.checking_style() == CheckingStyle::Error;
@@ -798,7 +831,11 @@ impl JournalParser {
     }
 
     /// Validate a transaction for common errors
-    fn validate_transaction(&self, transaction: &Transaction) -> Result<(), JournalParseError> {
+    fn validate_transaction(
+        &self,
+        transaction: &Transaction,
+        input: &str,
+    ) -> Result<(), JournalParseError> {
         // Check for empty transaction
         if transaction.postings.is_empty() {
             return Err(JournalParseError::ValidationError {
@@ -830,7 +867,11 @@ impl JournalParser {
                 filename,
                 line: self.context.line,
                 payee: transaction.payee.clone(),
-                description: transaction.format(&HashMap::default()),
+                description: input
+                    .lines()
+                    .nth(transaction.location.line() - 1)
+                    .unwrap()
+                    .to_string(),
             });
         }
 
@@ -838,7 +879,7 @@ impl JournalParser {
             if !self.context.tags.contains(tag) {
                 return Err(JournalParseError::UnknownTag {
                     filename,
-                    line: self.context.line,
+                    line: transaction.location.line(),
                     tag: tag.to_string(),
                 });
             }
@@ -848,18 +889,32 @@ impl JournalParser {
             if !posting.account.borrow().has_flag(AccountFlags::Known) {
                 return Err(JournalParseError::UnknownAccount {
                     filename,
-                    line: self.context.line,
-                    posting: posting.format(0, &HashMap::default()),
+                    line: posting.location.line(),
+                    posting: input.lines().nth(posting.location.line() - 1).unwrap().to_string(),
                     account: posting.account.borrow().fullname_immutable(),
                 });
             }
 
             if let Some(commodity) = posting.amount.as_ref().and_then(|a| a.commodity()) {
                 if !commodity.has_flags(CommodityFlags::KNOWN) {
+                    let posting_line =
+                        input.lines().nth(posting.location.line() - 1).unwrap().trim_start();
+                    let highlight_offset = if let Some(offset) = posting_line.rfind("  ") {
+                        offset + 2
+                    } else if let Some(offset) = posting_line.rfind('\t') {
+                        offset + 1
+                    } else {
+                        0
+                    };
                     return Err(JournalParseError::UnknownCommodity {
                         filename,
-                        line: self.context.line,
-                        posting: posting.format(0, &HashMap::default()),
+                        line: posting.location.line(),
+                        posting: format!("  {posting_line}"),
+                        highlight: format!(
+                            "{}{}",
+                            " ".repeat(highlight_offset + 2),
+                            "^".repeat(posting_line.len() - highlight_offset)
+                        ),
                         commodity: commodity.symbol().to_string(),
                     });
                 }
@@ -869,7 +924,7 @@ impl JournalParser {
                 if !self.context.tags.contains(tag) {
                     return Err(JournalParseError::UnknownTag {
                         filename,
-                        line: self.context.line,
+                        line: posting.location.line(),
                         tag: tag.to_string(),
                     });
                 }
@@ -1194,8 +1249,7 @@ fn journal_entries_with_recovery<'a>(
             Err(nom::Err::Error(_) | nom::Err::Failure(_)) => {
                 // Try to recover by skipping to next line
                 if let Some(newline_pos) = remaining.find('\n') {
-                    // TODO: update location in input
-                    remaining = Input::new(&remaining[newline_pos + 1..]);
+                    remaining = remaining.slice(newline_pos + 1..);
                     context.line += 1;
                     context.column = 1;
                 } else {
@@ -1375,7 +1429,11 @@ fn parse_transaction(input: Input<'_>) -> ParseResult<'_, Transaction> {
         parser(input)?;
 
     let payee_str = payee.unwrap_or_else(String::new);
-    let mut transaction = Transaction::new(date, payee_str);
+    let mut transaction =
+        Transaction::new(date, payee_str).at_location(JournalLocation::FileAndLine {
+            filename: PARSE_STATE.with(|s| s.borrow().filename.clone()),
+            line: input.location_line() as usize,
+        });
 
     if let Some(aux_date) = aux_date {
         transaction.set_aux_date(Some(aux_date));
@@ -1496,7 +1554,8 @@ pub(crate) fn parse_posting(input: Input<'_>) -> ParseResult<'_, Posting> {
     // TODO: Proper account management
     let account_ref = PARSE_STATE.with_borrow_mut(|state| state.find_or_create_account(&account));
 
-    let mut posting = Posting::new(account_ref);
+    let mut posting = Posting::new(account_ref)
+        .at_location(JournalLocation::Line(input.location_line() as usize));
 
     if let Some((mut amount, lot_price, cost)) = amount_price_cost {
         if let Some((calculate_price, mut price)) = lot_price {
@@ -1544,7 +1603,7 @@ pub(crate) fn parse_posting(input: Input<'_>) -> ParseResult<'_, Posting> {
 
 /// Parse an account name
 fn account_name(input: Input<'_>) -> ParseResult<'_, String> {
-    fn parse_account_name(input: Input<'_>) -> ParseResult<'_, &str> {
+    fn parse_account_name(input: Input<'_>) -> ParseResult<'_, Input<'_>> {
         let mut last_char_was_space = false;
         for (i, char) in input.char_indices() {
             match char {
@@ -1552,12 +1611,14 @@ fn account_name(input: Input<'_>) -> ParseResult<'_, String> {
                     return Err(nom::Err::Incomplete(nom::Needed::new(1)));
                 }
                 '\t' | '\n' | ';' | ' ' if last_char_was_space => {
-                    let (parsed, rest) = input.split_at(i - 1);
-                    return Ok((Input::new(rest), parsed));
+                    let parsed = input.slice(..i - 1);
+                    let rest = input.slice(i - 1..);
+                    return Ok((rest, parsed));
                 }
                 '\t' | '\n' | ';' => {
-                    let (parsed, rest) = input.split_at(i);
-                    return Ok((Input::new(rest), parsed));
+                    let parsed = input.slice(..i);
+                    let rest = input.slice(i..);
+                    return Ok((rest, parsed));
                 }
                 _ => {
                     last_char_was_space = char == ' ';
@@ -1565,10 +1626,11 @@ fn account_name(input: Input<'_>) -> ParseResult<'_, String> {
             }
         }
 
-        Ok((Input::new(""), input.fragment()))
+        let i = input.len();
+        Ok((input.slice(i..), input.slice(..i)))
     }
 
-    map(parse_account_name, |s: &str| s.trim().to_string())(input)
+    map(parse_account_name, |s| s.trim().to_string())(input)
 }
 
 /// Parse a commodity
@@ -2535,7 +2597,7 @@ mod tests {
         );
         // Don't add any postings
 
-        let result = parser.validate_transaction(&transaction);
+        let result = parser.validate_transaction(&transaction, "");
         assert!(result.is_err());
 
         if let Err(JournalParseError::ValidationError { message, .. }) = result {
@@ -2959,7 +3021,7 @@ mod tests {
             reset_parse_state();
             let (rem, amount) =
                 simple_amount_field(Input::new("-188,7974 STK @ 14,200 $")).unwrap();
-            assert_eq!(rem, Input::new(" @ 14,200 $"));
+            assert_eq!(rem.fragment(), &" @ 14,200 $");
             insta::assert_debug_snapshot!(amount, @r#"
                 AMOUNT(-188.7974 STK) [prec:4, keep:false, comm:STK, raw:-943987/5000]
             "#);
@@ -3261,21 +3323,23 @@ mod tests {
 
         // transaction with account the parser doesn't know about
         let input = textwrap::dedent(
-            "2011-03-06 Foo
+            "
+            2011-03-06 Foo
                 Act1  1
                 Act2
             ",
         );
+        let input = input.trim_start();
 
-        let (_, transaction) = parse_transaction(Input::new(&input)).unwrap();
+        let (_, transaction) = parse_transaction(Input::new(input)).unwrap();
 
         assert_debug_snapshot!(
-            parser.validate_transaction(&transaction),
+            parser.validate_transaction(&transaction, input),
             @r#"
                 Err(
                     UnknownAccount {
                         filename: StdIn,
-                        line: 1,
+                        line: 3,
                         posting: "    Act2",
                         account: "Act2",
                     },
@@ -3303,23 +3367,26 @@ mod tests {
 
         // transaction with commodity the parser doesn't know about
         let input = textwrap::dedent(
-            "2011-03-06 Foo
+            "
+            2011-03-06 Foo
                 Act1  1USD
                 Act1  1EUR
                 Act1
             ",
         );
+        let input = input.trim_start();
 
-        let (_, transaction) = parse_transaction(Input::new(&input)).unwrap();
+        let (_, transaction) = parse_transaction(Input::new(input)).unwrap();
 
         assert_debug_snapshot!(
-            parser.validate_transaction(&transaction),
+            parser.validate_transaction(&transaction, input),
             @r#"
                 Err(
                     UnknownCommodity {
                         filename: StdIn,
-                        line: 1,
-                        posting: "    Act1                                        1EUR",
+                        line: 3,
+                        posting: "  Act1  1EUR",
+                        highlight: "        ^^^^",
                         commodity: "EUR",
                     },
                 )
@@ -3337,17 +3404,19 @@ mod tests {
 
         // transaction with tag the parser doesn't know about
         let input = textwrap::dedent(
-            "2011-03-06 Foo
+            "
+            2011-03-06 Foo
                 ; :foo:
                 Act1  1
                 Act1
             ",
         );
+        let input = input.trim_start();
 
-        let (_, transaction) = parse_transaction(Input::new(&input)).unwrap();
+        let (_, transaction) = parse_transaction(Input::new(input)).unwrap();
 
         assert_debug_snapshot!(
-            parser.validate_transaction(&transaction),
+            parser.validate_transaction(&transaction, input),
             @r#"
                 Err(
                     UnknownTag {
@@ -3370,22 +3439,24 @@ mod tests {
 
         // transaction with payee the parser doesn't know about
         let input = textwrap::dedent(
-            "2011-03-06 Foo
+            "
+            2011-03-06 Foo
                 Act1  1
                 Act1
             ",
         );
+        let input = input.trim_start();
 
-        let (_, transaction) = parse_transaction(Input::new(&input)).unwrap();
+        let (_, transaction) = parse_transaction(Input::new(input)).unwrap();
 
         assert_debug_snapshot!(
-            parser.validate_transaction(&transaction),
+            parser.validate_transaction(&transaction, input),
             @r#"
                 Err(
                     UnknownPayee {
                         filename: StdIn,
                         line: 1,
-                        description: "2011/03/06 Foo\n    Act1                                           1\n    Act1\n",
+                        description: "2011-03-06 Foo",
                         payee: "Foo",
                     },
                 )

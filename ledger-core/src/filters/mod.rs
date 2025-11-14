@@ -454,11 +454,15 @@ impl PostingFilter for NoteFilter {}
 
 #[cfg(test)]
 mod tests {
+    use crate::parser::JournalLocation;
+
     use super::*;
     use chrono::NaiveDate;
 
     fn create_test_transaction() -> Transaction {
         Transaction {
+            location: JournalLocation::None,
+
             date: NaiveDate::from_ymd_opt(2024, 1, 15).unwrap(),
             aux_date: None,
             status: TransactionStatus::Cleared,
