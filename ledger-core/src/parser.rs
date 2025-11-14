@@ -202,7 +202,7 @@ pub enum JournalEntry {
     Transaction(Transaction),
     Directive(Directive),
     Comment(String),
-    MetadataComment { comment: String, metadata: HashMap<String, String> },
+    MetadataComment { comment: String, metadata: HashMap<String, TagData> },
     EmptyLine,
 }
 
@@ -1104,81 +1104,85 @@ fn empty_line(input: &str) -> ParseResult<'_, &str> {
 /// Parse metadata tags from comments with multiple supported patterns
 fn parse_metadata_tags(
     comment: &str,
-    metadata: Option<HashMap<String, String>>,
-) -> HashMap<String, String> {
+    metadata: Option<HashMap<String, TagData>>,
+) -> HashMap<String, TagData> {
     let mut metadata = metadata.unwrap_or_default();
 
     for line in comment.lines() {
-        let mut trimmed = line.trim();
+        let line = line.trim();
+        let parts: Vec<_> = line.split(":").collect();
 
-        while !trimmed.is_empty() {
-            // Pattern 1: :tag: value
-            if let Some(start) = trimmed.find(':') {
-                if let Some(end) = trimmed[start + 1..].find(':') {
-                    let tag_name = &trimmed[start + 1..start + 1 + end];
-                    // +2 because of the leading/trailing colons
-                    let remaining = &trimmed[tag_name.len() + 2..].trim();
+        match parts.as_slice() {
+            // empty comment or no colons => no tags
+            [] | [_] => {}
 
-                    let value_end_pos = remaining.find(' ').unwrap_or(remaining.len());
+            // single, simple tag, eg :foo:
+            [first, maybe_tag, last] if first.is_empty() && last.is_empty() => {
+                if !maybe_tag.contains(" ") {
+                    metadata.insert(maybe_tag.to_string(), TagData::empty());
+                }
+            }
 
-                    let value = remaining[..value_end_pos].trim();
+            // 2 adjacent colons => typed tag, eg tag:: [date]
+            [maybe_tag, "", maybe_value] => {
+                if !maybe_tag.contains(" ") {
+                    metadata.insert(maybe_tag.to_string(), TagData::new(maybe_value.trim()));
+                }
+            }
 
-                    if !tag_name.is_empty() {
-                        if value.is_empty() {
-                            metadata.insert(tag_name.to_string(), String::new());
+            // one colon => key:value
+            [maybe_tag, maybe_value] => {
+                if !maybe_tag.contains(" ") {
+                    metadata.insert(maybe_tag.to_string(), TagData::new(maybe_value.trim()));
+                }
+            }
+
+            // edge cases: tag and/or value contains colons
+            [first_part, ..] if !first_part.is_empty() && first_part.trim_end() == *first_part => {
+                let mut tag_parts = vec![first_part];
+                let mut value_parts = vec![];
+                for part in parts.iter().skip(1) {
+                    if value_parts.is_empty() && !part.contains(" ") {
+                        tag_parts.push(part);
+                    } else {
+                        value_parts.push(part);
+                    }
+                }
+
+                let tag = tag_parts.into_iter().cloned().collect::<Vec<_>>().join(":");
+                let value = value_parts.into_iter().cloned().collect::<Vec<_>>().join(":");
+                metadata.insert(tag, TagData::new(value.trim()));
+            }
+
+            [..] => {
+                // could be chain of tags
+                // :tag:tag:
+                // word :tag:tag:
+                // NOTE word:tag:tag: is actually tag `word:tag:tag`
+                // if end of part 1 is not empty or w/s, then it's a key:value
+                // - "word :foo:" would be "word "
+                // - ":tag:" would be ""
+                // - "word:tag" would be "word"
+
+                let mut found_one = false;
+                for part in parts {
+                    if part.is_empty() {
+                        // eg leading or trailing segment
+                        continue;
+                    }
+
+                    if part.contains(" ") {
+                        if found_one {
+                            break;
                         } else {
-                            metadata.insert(tag_name.to_string(), value.to_string());
+                            continue;
                         }
                     }
 
-                    trimmed = remaining[value_end_pos..].trim();
-                    continue;
+                    metadata.insert(part.to_string(), TagData::empty());
+                    found_one = true;
                 }
             }
-
-            // Pattern 2: [key: value] or [key=value]
-            if let Some(start) = trimmed.find('[') {
-                if let Some(end) = trimmed.find(']') {
-                    let bracket_content = &trimmed[start + 1..end];
-                    metadata = parse_metadata_tags(bracket_content, Some(metadata));
-
-                    trimmed = trimmed[bracket_content.len() + 2..].trim();
-                    continue;
-                }
-            }
-
-            // Pattern 3: key: value
-            if trimmed.chars().filter(|&c| c == ':').count() == 1 {
-                if let Some(equals_pos) = trimmed.find(": ") {
-                    let key = trimmed[..equals_pos].trim();
-                    let remaining = &trimmed[equals_pos + 2..];
-                    let value_end_pos = remaining.find(' ').unwrap_or(remaining.len());
-
-                    let value = remaining[..value_end_pos].trim();
-                    if !key.is_empty() && !key.contains(' ') {
-                        metadata.insert(key.to_string(), value.to_string());
-                    }
-                    trimmed = remaining[value_end_pos..].trim();
-                    continue;
-                }
-            }
-
-            // Pattern 4: key=value (no brackets/colons)
-            if trimmed.contains('=') {
-                if let Some(equals_pos) = trimmed.find('=') {
-                    let key = trimmed[..equals_pos].trim();
-                    let value_end_pos = trimmed.find(' ').unwrap_or(trimmed.len());
-
-                    let value = trimmed[equals_pos + 1..value_end_pos].trim();
-                    if !key.is_empty() && !key.contains(' ') {
-                        metadata.insert(key.to_string(), value.to_string());
-                    }
-                    trimmed = trimmed[value_end_pos..].trim();
-                    continue;
-                }
-            }
-
-            break;
         }
     }
 
@@ -1249,11 +1253,11 @@ fn parse_transaction(input: &str) -> ParseResult<'_, Transaction> {
         transaction.note = Some(comment);
 
         if let Some(payee) = metadata.get("Payee") {
-            transaction.payee = payee.clone();
+            if let Some(ref payee) = payee.value {
+                transaction.payee = payee.clone();
+            }
         }
 
-        let metadata: HashMap<String, TagData> =
-            metadata.into_iter().map(|(key, value)| (key, TagData::new(value))).collect();
         transaction.metadata.extend(metadata);
     }
 
@@ -2203,27 +2207,82 @@ mod tests {
     }
 
     #[test]
-    fn test_metadata_parsing_colon_style() {
-        let comment = " :Receipt: 12345 :Project: ABC";
-        let metadata = parse_metadata_tags(comment, None);
-        assert_eq!(metadata.get("Receipt"), Some(&"12345".to_string()));
-        assert_eq!(metadata.get("Project"), Some(&"ABC".to_string()));
-    }
+    fn test_parse_metadata_tags() {
+        // simple tag
+        let metadata = parse_metadata_tags(":tag:", None);
+        assert_eq!(metadata.get("tag"), Some(&TagData::empty()));
+        assert_eq!(1, metadata.len());
 
-    #[test]
-    fn test_metadata_parsing_bracket_style() {
-        let comment = " [Receipt: 12345] [Project=ABC]";
-        let metadata = parse_metadata_tags(comment, None);
-        assert_eq!(metadata.get("Receipt"), Some(&"12345".to_string()));
-        assert_eq!(metadata.get("Project"), Some(&"ABC".to_string()));
-    }
+        // chained tags
+        let metadata = parse_metadata_tags(":tag1:tag2:tag3:", None);
+        assert_eq!(metadata.get("tag1"), Some(&TagData::empty()));
+        assert_eq!(metadata.get("tag2"), Some(&TagData::empty()));
+        assert_eq!(metadata.get("tag3"), Some(&TagData::empty()));
+        assert_eq!(3, metadata.len());
 
-    #[test]
-    fn test_metadata_parsing_equals_style() {
-        let comment = " Receipt=12345 Project=ABC";
-        let metadata = parse_metadata_tags(comment, None);
-        assert_eq!(metadata.get("Receipt"), Some(&"12345".to_string()));
-        assert_eq!(metadata.get("Project"), Some(&"ABC".to_string()));
+        // tags with values
+        let metadata = parse_metadata_tags("tag: foo", None);
+        assert_eq!(metadata.get("tag"), Some(&TagData::new("foo")));
+        assert_eq!(1, metadata.len());
+
+        // typed tags
+        // TODO: these are parsed, but not yet typed
+        let metadata = parse_metadata_tags("tag:: [2025/11/08]", None);
+        assert_eq!(metadata.get("tag"), Some(&TagData::new("[2025/11/08]")));
+        assert_eq!(1, metadata.len());
+
+        //
+        // invalid and special cases
+        //
+
+        // no whitespace around tag
+        let metadata = parse_metadata_tags(":tag :", None);
+        assert_eq!(metadata.get("tag"), None);
+        assert!(metadata.is_empty());
+
+        // no whitespace in tag
+        let metadata = parse_metadata_tags(":with space:", None);
+        assert!(metadata.is_empty());
+
+        // "whitespace in tag" could be a tag w/ value
+        let metadata = parse_metadata_tags(":with space: value", None);
+        assert!(metadata.is_empty());
+
+        // simple tag preceded & followed by words
+        let metadata = parse_metadata_tags("foo :tag: bar", None);
+        assert_eq!(metadata.get("tag"), Some(&TagData::empty()));
+        assert_eq!(1, metadata.len());
+
+        // value tag cannot be preceded by words
+        let metadata = parse_metadata_tags("foo tag: value", None);
+        assert_eq!(metadata.get("tag"), None);
+        assert!(metadata.is_empty());
+
+        // tag followed by words => simple tag, not value
+        let metadata = parse_metadata_tags(":tag: value", None);
+        assert_eq!(metadata.get("tag"), Some(&TagData::empty()));
+        assert_eq!(1, metadata.len());
+
+        // not a chained tag => value tag with colons in tag name
+        let metadata = parse_metadata_tags("foo:bar:qux: value", None);
+        assert_eq!(metadata.get("foo:bar:qux"), Some(&TagData::new("value")));
+        assert_eq!(1, metadata.len());
+
+        // only 1 simple tag per line
+        let metadata = parse_metadata_tags(":tag1: :tag2:", None);
+        assert_eq!(metadata.get("tag1"), Some(&TagData::empty()));
+        assert_eq!(1, metadata.len());
+
+        // only 1 simple tag per line
+        let metadata = parse_metadata_tags(":tag1:\n:tag2:", None);
+        assert_eq!(metadata.get("tag1"), Some(&TagData::empty()));
+        assert_eq!(metadata.get("tag2"), Some(&TagData::empty()));
+        assert_eq!(2, metadata.len());
+
+        // only 1 tag with value per line
+        let metadata = parse_metadata_tags("tag: foo notTag: bar", None);
+        assert_eq!(metadata.get("tag"), Some(&TagData::new("foo notTag: bar")));
+        assert_eq!(1, metadata.len());
     }
 
     #[test]

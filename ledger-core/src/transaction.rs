@@ -55,15 +55,23 @@ pub enum TransactionType {
 }
 
 /// Tag data for metadata
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct TagData {
     pub value: Option<String>,
     pub inherited: bool,
 }
 
 impl TagData {
-    pub fn new(value: String) -> Self {
-        Self { value: Some(value), inherited: false }
+    pub fn new(value: &str) -> Self {
+        Self { value: Some(value.to_string()), inherited: false }
+    }
+
+    pub fn empty() -> Self {
+        Self { value: None, inherited: false }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.value.is_none()
     }
 }
 
