@@ -473,6 +473,13 @@ impl Transaction {
 
         Ok(())
     }
+
+    /// Format transaction into a String.
+    pub fn format(&self, journal_commodities: &HashMap<String, Arc<Commodity>>) -> String {
+        let mut buffer = Vec::new();
+        self.write(&mut buffer, journal_commodities).expect("writing to string");
+        String::from_utf8(buffer).unwrap()
+    }
 }
 
 /// Builder for ergonomic Transaction construction

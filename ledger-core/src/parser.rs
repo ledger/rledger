@@ -9,7 +9,7 @@
 //! - Streaming parser for large files
 
 use compact_str::CompactString;
-use ledger_math::{commodity::Precision, Annotation, CommodityFlags, CommodityPool};
+use ledger_math::{commodity::Precision, Annotation, CommodityFlags, CommodityPool, CommodityRef};
 use log::debug;
 use nom::{
     branch::alt,
@@ -30,11 +30,11 @@ use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::str::FromStr;
 use std::sync::Arc;
-use std::{cell::RefCell, fmt::Display};
-use std::{collections::HashMap, fmt::Pointer};
+use std::{cell::RefCell, collections::HashSet};
+use std::{collections::HashMap, fmt::Display};
 
 use crate::{
-    account::{Account, AccountRef},
+    account::{Account, AccountFlags, AccountRef},
     amount::Amount,
     commodity::Commodity,
     journal::Journal,
@@ -82,6 +82,27 @@ pub enum JournalParseError {
         message: String,
         difference: String,
     },
+
+    // TODO: use Posting, not String
+    #[error(
+        "While parsing file \"{filename}\", line {line}:\nWhile parsing posting:\n{posting}\nError: Unknown account '{account}'"
+    )]
+    UnknownAccount { filename: ParseInput, line: usize, posting: String, account: String },
+
+    #[error(
+        "While parsing file \"{filename}\", line {line}:\nWhile parsing posting:\n{posting}\nError: Unknown commodity '{commodity}'"
+    )]
+    UnknownCommodity { filename: ParseInput, line: usize, posting: String, commodity: String },
+
+    #[error(
+        "While parsing file \"{filename}\", line {line}:\nWhile parsing transaction:\n{description}\nError: Unknown payee '{payee}'"
+    )]
+    UnknownPayee { filename: ParseInput, line: usize, description: String, payee: String },
+
+    #[error(
+        "While parsing file \"{filename}\", line {line}:\nError: Unknown metadata tag '{tag}'"
+    )]
+    UnknownTag { filename: ParseInput, line: usize, tag: String },
 }
 
 /// Custom error type for detailed error reporting
@@ -123,7 +144,11 @@ pub enum ParseInput {
 impl Display for ParseInput {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            ParseInput::File(path_buf) => path_buf.fmt(f),
+            ParseInput::File(path_buf) => write!(
+                f,
+                "{}",
+                path_buf.canonicalize().expect("canonicalizing input path").display()
+            ),
             ParseInput::StdIn => write!(f, "<input>"),
         }
     }
@@ -154,6 +179,10 @@ pub struct ParseContext {
     pub commodity_aliases: HashMap<String, String>,
     /// Account aliases
     pub account_aliases: HashMap<String, String>,
+    /// Payee registry
+    pub payees: HashSet<String>,
+    /// Tag registry
+    pub tags: HashSet<String>,
 }
 
 impl ParseContext {
@@ -166,6 +195,34 @@ impl ParseContext {
             self.accounts.insert(name.to_string(), account.clone());
             account
         }
+    }
+
+    /// Create a known (predeclared) account.
+    pub fn create_known_account(&mut self, name: &str) {
+        let mut account = Account::new(CompactString::from(name), None, 0);
+        account.add_flag(AccountFlags::Known);
+        self.accounts.insert(name.to_string(), Rc::new(RefCell::new(account)));
+    }
+
+    /// Create a known (predeclared) commodity.
+    pub fn create_known_commodity(&mut self, symbol: &str) {
+        let mut commodity = Commodity::new(symbol);
+        commodity.add_flags(CommodityFlags::KNOWN);
+        self.commodity_pool.insert(commodity);
+    }
+
+    /// Create a known (predeclared) payee.
+    pub fn create_known_payee(&mut self, name: &str) {
+        self.payees.insert(name.to_string());
+    }
+
+    /// Create a known (predeclared) tag.
+    pub fn create_known_tag(&mut self, name: &str) {
+        self.tags.insert(name.to_string());
+    }
+
+    pub fn register_commodity(&mut self, symbol: &str) -> CommodityRef {
+        self.commodity_pool.find_or_create(symbol)
     }
 }
 
@@ -183,8 +240,19 @@ impl Default for ParseContext {
             commodity_pool: CommodityPool::new(),
             commodity_aliases: HashMap::new(),
             account_aliases: HashMap::new(),
+            payees: HashSet::new(),
+            tags: HashSet::new(),
         }
     }
+}
+
+/// Checking styles for accounts, commodities, etc.
+#[derive(Debug, Clone, PartialEq)]
+pub enum CheckingStyle {
+    Permissive,
+    Normal,
+    Warn,
+    Error,
 }
 
 /// Apply directive state types
@@ -325,15 +393,42 @@ pub enum PayeeDeclaration {
     Uuid(String),
 }
 
+#[derive(Default)]
+pub struct JournalParserConfig {
+    pub pedantic: bool,
+    pub strict: bool,
+    pub check_payees: bool,
+}
+
+impl JournalParserConfig {
+    /// How should the journal be checked during parse.
+    pub fn checking_style(&self) -> CheckingStyle {
+        if self.pedantic {
+            return CheckingStyle::Error;
+        } else if self.strict {
+            return CheckingStyle::Warn;
+        }
+
+        // TODO: CheckingStyle::Permissive
+        CheckingStyle::Normal
+    }
+}
+
 /// Main parser interface for streaming large files
 pub struct JournalParser {
+    config: JournalParserConfig,
     context: ParseContext,
 }
 
 impl JournalParser {
-    /// Create a new parser with default context
+    /// Create a new parser with default config and context
     pub fn new() -> Self {
-        JournalParser { context: ParseContext::default() }
+        JournalParser { config: JournalParserConfig::default(), context: ParseContext::default() }
+    }
+
+    /// Create a new parser with given config and default context
+    pub fn with_config(config: JournalParserConfig) -> Self {
+        JournalParser { config, context: ParseContext::default() }
     }
 
     /// Create a parser with specified filename
@@ -377,9 +472,9 @@ impl JournalParser {
     /// Parse a complete journal from a string
     pub fn parse_journal(&mut self, input: &str) -> Result<Journal, JournalParseError> {
         let entries = {
-            PARSE_STATE.with_borrow_mut(|c| c.commodity_pool = self.context.commodity_pool.clone());
+            PARSE_STATE.replace(self.context.clone());
             let entries = self.parse_entries(input)?;
-            self.context.commodity_pool = PARSE_STATE.with_borrow_mut(|c| c.commodity_pool.clone());
+            self.context = PARSE_STATE.with_borrow_mut(|c| c.clone());
             entries
         };
         let journal = self.build_journal(entries)?;
@@ -420,6 +515,7 @@ impl JournalParser {
         journal.accounts = self.context.accounts.clone();
         journal.commodity_pool = self.context.commodity_pool.clone();
 
+        let mut any_error = false;
         for entry in entries {
             match entry {
                 JournalEntry::Transaction(transaction) => {
@@ -430,8 +526,8 @@ impl JournalParser {
                     match self.validate_transaction(&transaction) {
                         Ok(_) => journal.add_transaction(transaction),
                         Err(validation_error) => {
-                            // For now, log error and continue - could be made strict
-                            eprintln!("Warning: {}", validation_error);
+                            any_error = self.config.checking_style() == CheckingStyle::Error;
+                            eprintln!("{}", validation_error);
                             journal.add_transaction(transaction);
                         }
                     }
@@ -448,7 +544,17 @@ impl JournalParser {
             }
         }
 
-        Ok(journal)
+        if any_error {
+            // FIXME: this error is "fake", just to signal failure to calling code
+            Err(JournalParseError::ValidationError {
+                filename: ParseInput::File(PathBuf::new()),
+                line: 0,
+                message: String::new(),
+                transaction_description: String::new(),
+            })
+        } else {
+            Ok(journal)
+        }
     }
 
     /// Register accounts and commodities from a transaction
@@ -721,6 +827,62 @@ impl JournalParser {
                 message: balance_error.message,
                 difference: balance_error.difference,
             });
+        }
+
+        let filename = match self.config.checking_style() {
+            CheckingStyle::Warn | CheckingStyle::Error => self.context.filename.clone(),
+            CheckingStyle::Permissive | CheckingStyle::Normal => return Ok(()),
+        };
+
+        if !self.context.payees.contains(&transaction.payee) && self.config.check_payees {
+            return Err(JournalParseError::UnknownPayee {
+                filename,
+                line: self.context.line,
+                payee: transaction.payee.clone(),
+                description: transaction.format(&HashMap::default()),
+            });
+        }
+
+        for tag in transaction.metadata.keys() {
+            if !self.context.tags.contains(tag) {
+                return Err(JournalParseError::UnknownTag {
+                    filename,
+                    line: self.context.line,
+                    tag: tag.to_string(),
+                });
+            }
+        }
+
+        for posting in transaction.postings.iter() {
+            if !posting.account.borrow().has_flag(AccountFlags::Known) {
+                return Err(JournalParseError::UnknownAccount {
+                    filename,
+                    line: self.context.line,
+                    posting: posting.format(0, &HashMap::default()),
+                    account: posting.account.borrow().fullname_immutable(),
+                });
+            }
+
+            if let Some(commodity) = posting.amount.as_ref().and_then(|a| a.commodity()) {
+                if !commodity.has_flags(CommodityFlags::KNOWN) {
+                    return Err(JournalParseError::UnknownCommodity {
+                        filename,
+                        line: self.context.line,
+                        posting: posting.format(0, &HashMap::default()),
+                        commodity: commodity.symbol().to_string(),
+                    });
+                }
+            }
+
+            for tag in posting.metadata.keys() {
+                if !self.context.tags.contains(tag) {
+                    return Err(JournalParseError::UnknownTag {
+                        filename,
+                        line: self.context.line,
+                        tag: tag.to_string(),
+                    });
+                }
+            }
         }
 
         Ok(())
@@ -1727,16 +1889,7 @@ fn amount_field_impl(input: &str, options: AmountFieldOptions) -> ParseResult<'_
     debug!("detected cmdty: {:?}", &commodity_symbol);
 
     let commodity = if let Some(commodity_symbol) = commodity_symbol {
-        let commodity =
-            PARSE_STATE.with_borrow_mut(|c| c.commodity_pool.find_or_create(&commodity_symbol));
-        if ["€", "$"].contains(&commodity.symbol()) {
-            debug!(
-                "existing cmdty: {} {} {:#?}",
-                commodity.symbol(),
-                commodity.precision(),
-                commodity.flags()
-            );
-        }
+        let commodity = PARSE_STATE.with_borrow_mut(|c| c.register_commodity(&commodity_symbol));
 
         let existing_format_is_euro = commodity.has_flags(CommodityFlags::STYLE_DECIMAL_COMMA);
         let try_format = match quantity.decimal_format {
@@ -1888,19 +2041,39 @@ fn process_directive_inline(directive: Directive) -> Directive {
                 .with_borrow_mut(|c| c.commodity_pool.set_default_commodity(commodity.clone()));
         }
 
+        Directive::Account { ref name, declarations: _ } => {
+            PARSE_STATE.with_borrow_mut(|state| {
+                state.create_known_account(name);
+            });
+        }
+
+        Directive::Commodity { ref symbol, declarations: _ } => {
+            PARSE_STATE.with_borrow_mut(|state| {
+                state.create_known_commodity(symbol);
+            });
+        }
+
+        Directive::Payee { ref name, declarations: _ } => {
+            PARSE_STATE.with_borrow_mut(|state| {
+                state.create_known_payee(name);
+            });
+        }
+
+        Directive::Tag { ref name } => {
+            PARSE_STATE.with_borrow_mut(|state| {
+                state.create_known_tag(name);
+            });
+        }
+
         // no inline processing for these directives
-        Directive::Account { .. }
-        | Directive::Alias { .. }
+        Directive::Alias { .. }
         | Directive::Apply { .. }
         | Directive::End
         | Directive::Assert { .. }
         | Directive::Check { .. }
-        | Directive::Commodity { .. }
         | Directive::Price { .. }
         | Directive::Include { .. }
         | Directive::ConditionalInclude { .. }
-        | Directive::Payee { .. }
-        | Directive::Tag { .. }
         | Directive::Option { .. }
         | Directive::Eval { .. }
         | Directive::Define { .. }
@@ -3040,5 +3213,167 @@ mod tests {
         }
 
         assert!(journal_iter.next().is_none());
+    }
+
+    #[test]
+    fn test_parse_journal() {
+        let input = textwrap::dedent(
+            "
+            2011-03-06 Foo
+                Act1  1
+                Act2
+            ",
+        );
+
+        let mut parser = JournalParser::new();
+        let journal = parser.parse_journal(&input).unwrap();
+
+        assert_eq!(1, journal.transactions.len());
+        assert_eq!("Foo".to_string(), journal.transactions.get(0).unwrap().payee);
+    }
+
+    #[test]
+    fn test_parser_validation_unknown_account() {
+        let mut parser = JournalParser::with_config(JournalParserConfig {
+            pedantic: true,
+            strict: false,
+            check_payees: false,
+        });
+
+        // make sure the parser knows about Act1
+        parser.parse_journal("account Act1\n").unwrap();
+
+        // transaction with account the parser doesn't know about
+        let input = textwrap::dedent(
+            "2011-03-06 Foo
+                Act1  1
+                Act2
+            ",
+        );
+
+        let (_, transaction) = parse_transaction(&input).unwrap();
+
+        assert_debug_snapshot!(
+            parser.validate_transaction(&transaction),
+            @r#"
+                Err(
+                    UnknownAccount {
+                        filename: StdIn,
+                        line: 1,
+                        posting: "    Act2",
+                        account: "Act2",
+                    },
+                )
+            "#
+        );
+    }
+
+    #[test]
+    fn test_parser_validation_unknown_commodity() {
+        let mut parser = JournalParser::with_config(JournalParserConfig {
+            pedantic: true,
+            strict: false,
+            check_payees: false,
+        });
+
+        // make sure the parser knows about Act1 and USD
+        let input = textwrap::dedent(
+            "
+            account Act1
+            commodity USD
+            ",
+        );
+        parser.parse_journal(&input).unwrap();
+
+        // transaction with commodity the parser doesn't know about
+        let input = textwrap::dedent(
+            "2011-03-06 Foo
+                Act1  1USD
+                Act1  1EUR
+                Act1
+            ",
+        );
+
+        let (_, transaction) = parse_transaction(&input).unwrap();
+
+        assert_debug_snapshot!(
+            parser.validate_transaction(&transaction),
+            @r#"
+                Err(
+                    UnknownCommodity {
+                        filename: StdIn,
+                        line: 1,
+                        posting: "    Act1                                        1EUR",
+                        commodity: "EUR",
+                    },
+                )
+            "#
+        );
+    }
+
+    #[test]
+    fn test_parser_validation_unknown_tag() {
+        let parser = JournalParser::with_config(JournalParserConfig {
+            pedantic: true,
+            strict: false,
+            check_payees: false,
+        });
+
+        // transaction with tag the parser doesn't know about
+        let input = textwrap::dedent(
+            "2011-03-06 Foo
+                ; :foo:
+                Act1  1
+                Act1
+            ",
+        );
+
+        let (_, transaction) = parse_transaction(&input).unwrap();
+
+        assert_debug_snapshot!(
+            parser.validate_transaction(&transaction),
+            @r#"
+                Err(
+                    UnknownTag {
+                        filename: StdIn,
+                        line: 1,
+                        tag: "foo",
+                    },
+                )
+            "#
+        );
+    }
+
+    #[test]
+    fn test_parser_validation_unknown_payee() {
+        let parser = JournalParser::with_config(JournalParserConfig {
+            pedantic: true,
+            strict: false,
+            check_payees: true,
+        });
+
+        // transaction with payee the parser doesn't know about
+        let input = textwrap::dedent(
+            "2011-03-06 Foo
+                Act1  1
+                Act1
+            ",
+        );
+
+        let (_, transaction) = parse_transaction(&input).unwrap();
+
+        assert_debug_snapshot!(
+            parser.validate_transaction(&transaction),
+            @r#"
+                Err(
+                    UnknownPayee {
+                        filename: StdIn,
+                        line: 1,
+                        description: "2011/03/06 Foo\n    Act1                                           1\n    Act1\n",
+                        payee: "Foo",
+                    },
+                )
+            "#
+        );
     }
 }

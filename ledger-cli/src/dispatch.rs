@@ -10,7 +10,7 @@ use crate::{commands, completion};
 use anyhow::{Context, Result};
 use clap::CommandFactory;
 use ledger_core::journal::Journal;
-use ledger_core::parser::JournalParser;
+use ledger_core::parser::{JournalParser, JournalParserConfig};
 use ledger_core::posting::Posting;
 use regex::Regex;
 use std::collections::HashSet;
@@ -45,7 +45,7 @@ impl Dispatcher {
         }
 
         // Load journal files for regular commands
-        self.load_journal_files()?;
+        self.load_journal_files(cli)?;
 
         // Execute the main command
         match &cli.command {
@@ -146,13 +146,17 @@ impl Dispatcher {
     }
 
     /// Load journal files specified in the session and store the parsed journal
-    fn load_journal_files(&mut self) -> Result<()> {
+    fn load_journal_files(&mut self, cli: &Cli) -> Result<()> {
         if self.session.journal_files.is_empty() {
             return Err(anyhow::anyhow!("No journal files specified"));
         }
 
         let mut journal = Journal::new();
-        let mut parser = JournalParser::new();
+        let mut parser = JournalParser::with_config(JournalParserConfig {
+            pedantic: cli.pedantic,
+            strict: cli.strict,
+            check_payees: cli.check_payees,
+        });
 
         for file in &self.session.journal_files {
             if self.session.verbose_enabled {
