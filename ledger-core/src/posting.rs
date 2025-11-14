@@ -9,6 +9,7 @@ use std::sync::Arc;
 use unicode_width::UnicodeWidthStr;
 
 use crate::account::AccountRef;
+use crate::parser::JournalLocation;
 use crate::strings::{AccountName, PayeeName};
 use crate::transaction::{Position, TagData};
 use ledger_math::amount::Amount;
@@ -61,6 +62,9 @@ pub struct PostingExtData {
 /// Represents a posting (line item) within a transaction
 #[derive(Debug, Clone)]
 pub struct Posting {
+    /// Location of this posting within the journal file.
+    pub location: JournalLocation,
+
     /// Reference to the account for this posting
     pub account: AccountRef,
     /// Amount posted (can be None until finalization)
@@ -122,6 +126,7 @@ impl Posting {
     /// Create a new posting with required account
     pub fn new(account: AccountRef) -> Self {
         Self {
+            location: JournalLocation::None,
             account,
             amount: None,
             amount_expr: None,
@@ -146,6 +151,12 @@ impl Posting {
         let mut posting = Self::new(account);
         posting.amount = Some(amount);
         posting
+    }
+
+    /// Set the location for this posting.
+    pub fn at_location(mut self, location: JournalLocation) -> Self {
+        self.location = location;
+        self
     }
 
     /// Check if posting must balance in the transaction
@@ -481,7 +492,7 @@ mod tests {
     #[test]
     fn test_parse_and_format_posting() {
         let (_, posting) =
-            parse_posting("Actif:BC                               -340,00 €").unwrap();
+            parse_posting("Actif:BC                               -340,00 €".into()).unwrap();
         insta::assert_snapshot!(
             posting.format(0, &HashMap::default()),
             @r#"    Actif:BC                               -340,00 €"#
@@ -490,7 +501,8 @@ mod tests {
 
     #[test]
     fn test_parse_and_format_posting_with_extra_precision() {
-        let (_, posting) = parse_posting("Actif:SSB                       125,0000   STK").unwrap();
+        let (_, posting) =
+            parse_posting("Actif:SSB                       125,0000   STK".into()).unwrap();
         insta::assert_snapshot!(
             posting.format(0, &HashMap::default()),
             @r#"    Actif:SSB                           125,0000 STK"#
@@ -500,7 +512,8 @@ mod tests {
     #[test]
     fn test_parse_and_format_posting_with_cost() {
         let (_, posting) =
-            parse_posting("Actif:SV                              1,0204 MFE @ 333,20 €").unwrap();
+            parse_posting("Actif:SV                              1,0204 MFE @ 333,20 €".into())
+                .unwrap();
         insta::assert_snapshot!(
             posting.format(0, &HashMap::default()),
             @r#"    Actif:SV                              1,0204 MFE @ 333,2 €"#

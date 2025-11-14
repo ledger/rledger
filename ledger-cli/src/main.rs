@@ -47,8 +47,6 @@ fn main() -> Result<()> {
     match dispatcher.execute(&cli) {
         Ok(exit_code) => process::exit(exit_code),
         Err(e) => {
-            eprintln!("Error: {}", e);
-
             // Show error chain if in verbose mode
             if cli.verbose {
                 let mut cause = e.source();

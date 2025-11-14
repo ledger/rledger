@@ -1,5 +1,6 @@
 //! Transaction representation
 
+use crate::parser::JournalLocation;
 use crate::posting::{Posting, PostingFlags};
 use chrono::NaiveDate;
 use ledger_math::amount::Amount;
@@ -55,21 +56,32 @@ pub enum TransactionType {
 }
 
 /// Tag data for metadata
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct TagData {
     pub value: Option<String>,
     pub inherited: bool,
 }
 
 impl TagData {
-    pub fn new(value: String) -> Self {
-        Self { value: Some(value), inherited: false }
+    pub fn new(value: &str) -> Self {
+        Self { value: Some(value.to_string()), inherited: false }
+    }
+
+    pub fn empty() -> Self {
+        Self { value: None, inherited: false }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.value.is_none()
     }
 }
 
 /// Represents a transaction (xact in C++)
 #[derive(Debug, Clone)]
 pub struct Transaction {
+    /// TODO:
+    pub location: JournalLocation,
+
     /// Transaction date
     pub date: NaiveDate,
     /// Optional auxiliary/effective date
@@ -105,6 +117,7 @@ impl Default for TransactionFlags {
 impl Default for Transaction {
     fn default() -> Self {
         Transaction {
+            location: JournalLocation::None,
             date: chrono::Local::now().date_naive(),
             aux_date: None,
             status: TransactionStatus::Uncleared,
@@ -125,6 +138,7 @@ impl Transaction {
     /// Create a new transaction with required fields
     pub fn new(date: NaiveDate, payee: String) -> Self {
         Self {
+            location: JournalLocation::None,
             date,
             aux_date: None,
             status: TransactionStatus::default(),
@@ -138,6 +152,12 @@ impl Transaction {
             metadata: HashMap::new(),
             sequence: 0,
         }
+    }
+
+    /// Set the location for this transaction.
+    pub fn at_location(mut self, location: JournalLocation) -> Self {
+        self.location = location;
+        self
     }
 
     /// Add a posting to this transaction
@@ -465,6 +485,13 @@ impl Transaction {
 
         Ok(())
     }
+
+    /// Format transaction into a String.
+    pub fn format(&self, journal_commodities: &HashMap<String, Arc<Commodity>>) -> String {
+        let mut buffer = Vec::new();
+        self.write(&mut buffer, journal_commodities).expect("writing to string");
+        String::from_utf8(buffer).unwrap()
+    }
 }
 
 /// Builder for ergonomic Transaction construction
@@ -619,6 +646,8 @@ impl TransactionBuilder {
     /// Build the transaction, performing validation
     pub fn build(self) -> Result<Transaction, String> {
         let mut transaction = Transaction {
+            // FIXME:
+            location: JournalLocation::None,
             date: self.date,
             aux_date: self.aux_date,
             status: self.status,
@@ -641,6 +670,8 @@ impl TransactionBuilder {
     /// Build the transaction without validation (useful for incomplete transactions)
     pub fn build_unchecked(self) -> Transaction {
         Transaction {
+            // FIXME:
+            location: JournalLocation::None,
             date: self.date,
             aux_date: self.aux_date,
             status: self.status,
@@ -659,6 +690,8 @@ impl TransactionBuilder {
     /// Try to auto-balance and get validation errors without building
     pub fn validate(&mut self) -> Result<(), String> {
         let mut temp_transaction = Transaction {
+            // FIXME:
+            location: JournalLocation::None,
             date: self.date,
             aux_date: self.aux_date,
             status: self.status,
@@ -689,6 +722,8 @@ impl TransactionBuilder {
     /// Check if transaction would balance
     pub fn is_balanced(&self) -> bool {
         let temp_transaction = Transaction {
+            // FIXME:
+            location: JournalLocation::None,
             date: self.date,
             aux_date: self.aux_date,
             status: self.status,
@@ -856,6 +891,8 @@ impl Transaction {
             self.postings.iter().filter(|p| p.is_virtual()).cloned().collect();
 
         Transaction {
+            // FIXME:
+            location: JournalLocation::None,
             date: self.date,
             aux_date: self.aux_date,
             status: self.status,
@@ -877,6 +914,8 @@ impl Transaction {
             self.postings.iter().filter(|p| p.must_balance()).cloned().collect();
 
         Transaction {
+            // FIXME:
+            location: JournalLocation::None,
             date: self.date,
             aux_date: self.aux_date,
             status: self.status,

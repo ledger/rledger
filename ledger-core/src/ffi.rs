@@ -9,6 +9,7 @@ use std::ffi::{CStr, CString};
 use std::os::raw::{c_char, c_double, c_int};
 use std::ptr::null_mut;
 
+use crate::parser::JournalLocation;
 use crate::{
     amount::Amount,
     commodity::Commodity,
@@ -586,6 +587,7 @@ pub extern "C" fn ledger_transaction_new(date: CDate, payee: *const c_char) -> *
     };
 
     let transaction = Box::new(Transaction {
+        location: JournalLocation::None,
         date: naive_date,
         aux_date: None,
         status: TransactionStatus::Uncleared,

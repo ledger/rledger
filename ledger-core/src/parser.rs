@@ -8,32 +8,34 @@
 //! - Include file resolution with cycle detection
 //! - Streaming parser for large files
 
-use ledger_math::{commodity::Precision, Annotation, CommodityFlags, CommodityPool};
+use compact_str::CompactString;
+use ledger_math::{commodity::Precision, Annotation, CommodityFlags, CommodityPool, CommodityRef};
 use log::debug;
 use nom::{
     branch::alt,
-    bytes::complete::{is_not, take_until, take_while_m_n},
+    bytes::complete::{is_a, is_not, tag, take_until, take_while_m_n},
     character::complete::{char, digit1, line_ending, space0, space1},
     combinator::{consumed, map, not, opt, success, value, verify},
-    error::{context, ParseError},
+    error::{context, ParseError, VerboseError},
     multi::{many0, many1, many_m_n},
     sequence::{delimited, pair, preceded, terminated, tuple},
-    AsChar, IResult,
+    AsChar, IResult, Slice,
 };
+use nom_locate::LocatedSpan;
 
 // We need to use bytes for tag with byte strings
 
-use std::cell::RefCell;
-use std::collections::HashMap;
 use std::fs::File;
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::str::FromStr;
 use std::sync::Arc;
+use std::{cell::RefCell, collections::HashSet};
+use std::{collections::HashMap, fmt::Display};
 
 use crate::{
-    account::Account,
+    account::{Account, AccountFlags, AccountRef},
     amount::Amount,
     commodity::Commodity,
     journal::Journal,
@@ -49,7 +51,7 @@ use rust_decimal::Decimal;
 pub enum JournalParseError {
     #[error("Parse error in {filename} at line {line}, column {column}: {message}")]
     ParseError {
-        filename: PathBuf,
+        filename: ParseInput,
         line: usize,
         column: usize,
         message: String,
@@ -68,37 +70,53 @@ pub enum JournalParseError {
     },
     #[error("Transaction validation error in {filename} at line {line}: {message}")]
     ValidationError {
-        filename: PathBuf,
+        filename: ParseInput,
         line: usize,
         message: String,
         transaction_description: String,
     },
     #[error("Unbalanced transaction in {filename} at line {line}: {message}\nTransaction: {description}\nDifference: {difference}")]
     UnbalancedTransaction {
-        filename: PathBuf,
+        filename: ParseInput,
         line: usize,
         description: String,
         message: String,
         difference: String,
     },
-}
 
-/// Custom error type for detailed error reporting
-pub type VerboseError<I> = nom::error::VerboseError<I>;
+    // TODO: use Posting, not String
+    #[error(
+        "While parsing file \"{filename}\", line {line}:\nWhile parsing posting:\n{posting}\nError: Unknown account '{account}'"
+    )]
+    UnknownAccount { filename: ParseInput, line: usize, posting: String, account: String },
+
+    #[error(
+        "While parsing file \"{filename}\", line {line}:\nWhile parsing posting:\n{posting}\n{highlight}\nError: Unknown commodity '{commodity}'"
+    )]
+    UnknownCommodity {
+        filename: ParseInput,
+        line: usize,
+        posting: String,
+        highlight: String,
+        commodity: String,
+    },
+
+    #[error(
+        "While parsing file \"{filename}\", line {line}:\nWhile parsing transaction:\n{description}\nError: Unknown payee '{payee}'"
+    )]
+    UnknownPayee { filename: ParseInput, line: usize, description: String, payee: String },
+
+    #[error(
+        "While parsing file \"{filename}\", line {line}:\nError: Unknown metadata tag '{tag}'"
+    )]
+    UnknownTag { filename: ParseInput, line: usize, tag: String },
+}
 
 /// Result type for parsing operations
-type ParseResult<'a, T> = IResult<&'a str, T, VerboseError<&'a str>>;
+type ParseResult<'a, T> = IResult<Input<'a>, T, VerboseError<Input<'a>>>;
 
-// Helper function for string tags that works with VerboseError
-fn tag<'a>(s: &'a str) -> impl Fn(&'a str) -> ParseResult<'a, &'a str> + 'a {
-    move |input: &'a str| {
-        if let Some(stripped) = input.strip_prefix(s) {
-            Ok((stripped, s))
-        } else {
-            Err(nom::Err::Error(VerboseError::from_error_kind(input, nom::error::ErrorKind::Tag)))
-        }
-    }
-}
+/// Convenience type wrapping LocatedSpan<&str>
+type Input<'a> = LocatedSpan<&'a str>;
 
 // thread_local! allows shared global state during parse while still allowing us
 // to run tests in parallel. Won't work if parsing is ever multithreaded.
@@ -112,11 +130,54 @@ pub fn reset_parse_state() {
     PARSE_STATE.with_borrow_mut(|c| c.commodity_pool = CommodityPool::new());
 }
 
+/// What sort of input has been provided to the parser.
+#[derive(Debug, Clone)]
+pub enum ParseInput {
+    File(PathBuf),
+    StdIn,
+}
+
+impl Display for ParseInput {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ParseInput::File(path_buf) => write!(
+                f,
+                "{}",
+                path_buf.canonicalize().expect("canonicalizing input path").display()
+            ),
+            ParseInput::StdIn => write!(f, "<input>"),
+        }
+    }
+}
+
+/// A location within a journal file.
+#[derive(Debug, Clone)]
+pub enum JournalLocation {
+    /// Location with filename and line.
+    FileAndLine { filename: ParseInput, line: usize },
+
+    /// Location with line only; filename can be inferred from the containing entry.
+    Line(usize),
+
+    /// No location. eg Virtual and Automatic transactions
+    None,
+}
+
+impl JournalLocation {
+    // FIXME: should be Option?
+    pub fn line(&self) -> usize {
+        match self {
+            JournalLocation::FileAndLine { line, .. } | JournalLocation::Line(line) => *line,
+            JournalLocation::None => 0,
+        }
+    }
+}
+
 /// Parser state structure for context management
 #[derive(Debug, Clone)]
 pub struct ParseContext {
     /// Current file being parsed
-    pub filename: PathBuf,
+    pub filename: ParseInput,
     /// Current line number
     pub line: usize,
     /// Current column number
@@ -129,29 +190,88 @@ pub struct ParseContext {
     pub current_year: Option<i32>,
     /// Default account for unbalanced postings
     pub default_account: Option<String>,
+    /// Account registry
+    pub accounts: HashMap<String, AccountRef>,
     /// Commodity pool
     pub commodity_pool: CommodityPool,
     /// Commodity aliases
     pub commodity_aliases: HashMap<String, String>,
     /// Account aliases
     pub account_aliases: HashMap<String, String>,
+    /// Payee registry
+    pub payees: HashSet<String>,
+    /// Tag registry
+    pub tags: HashSet<String>,
+}
+
+impl ParseContext {
+    /// Find or create an account by name
+    pub fn find_or_create_account(&mut self, name: &str) -> AccountRef {
+        if let Some(account) = self.accounts.get(name) {
+            account.clone()
+        } else {
+            let account = Rc::new(RefCell::new(Account::new(CompactString::from(name), None, 0)));
+            self.accounts.insert(name.to_string(), account.clone());
+            account
+        }
+    }
+
+    /// Create a known (predeclared) account.
+    pub fn create_known_account(&mut self, name: &str) {
+        let mut account = Account::new(CompactString::from(name), None, 0);
+        account.add_flag(AccountFlags::Known);
+        self.accounts.insert(name.to_string(), Rc::new(RefCell::new(account)));
+    }
+
+    /// Create a known (predeclared) commodity.
+    pub fn create_known_commodity(&mut self, symbol: &str) {
+        let mut commodity = Commodity::new(symbol);
+        commodity.add_flags(CommodityFlags::KNOWN);
+        self.commodity_pool.insert(commodity);
+    }
+
+    /// Create a known (predeclared) payee.
+    pub fn create_known_payee(&mut self, name: &str) {
+        self.payees.insert(name.to_string());
+    }
+
+    /// Create a known (predeclared) tag.
+    pub fn create_known_tag(&mut self, name: &str) {
+        self.tags.insert(name.to_string());
+    }
+
+    pub fn register_commodity(&mut self, symbol: &str) -> CommodityRef {
+        self.commodity_pool.find_or_create(symbol)
+    }
 }
 
 impl Default for ParseContext {
     fn default() -> Self {
         ParseContext {
-            filename: PathBuf::from("<input>"),
+            filename: ParseInput::StdIn,
             line: 1,
             column: 1,
             include_stack: Vec::new(),
             apply_stack: Vec::new(),
             current_year: None,
+            accounts: HashMap::new(),
             default_account: None,
             commodity_pool: CommodityPool::new(),
             commodity_aliases: HashMap::new(),
             account_aliases: HashMap::new(),
+            payees: HashSet::new(),
+            tags: HashSet::new(),
         }
     }
+}
+
+/// Checking styles for accounts, commodities, etc.
+#[derive(Debug, Clone, PartialEq)]
+pub enum CheckingStyle {
+    Permissive,
+    Normal,
+    Warn,
+    Error,
 }
 
 /// Apply directive state types
@@ -169,7 +289,7 @@ pub enum JournalEntry {
     Transaction(Transaction),
     Directive(Directive),
     Comment(String),
-    MetadataComment { comment: String, metadata: HashMap<String, String> },
+    MetadataComment { comment: String, metadata: HashMap<String, TagData> },
     EmptyLine,
 }
 
@@ -292,21 +412,48 @@ pub enum PayeeDeclaration {
     Uuid(String),
 }
 
+#[derive(Default)]
+pub struct JournalParserConfig {
+    pub pedantic: bool,
+    pub strict: bool,
+    pub check_payees: bool,
+}
+
+impl JournalParserConfig {
+    /// How should the journal be checked during parse.
+    pub fn checking_style(&self) -> CheckingStyle {
+        if self.pedantic {
+            return CheckingStyle::Error;
+        } else if self.strict {
+            return CheckingStyle::Warn;
+        }
+
+        // TODO: CheckingStyle::Permissive
+        CheckingStyle::Normal
+    }
+}
+
 /// Main parser interface for streaming large files
 pub struct JournalParser {
+    config: JournalParserConfig,
     context: ParseContext,
 }
 
 impl JournalParser {
-    /// Create a new parser with default context
+    /// Create a new parser with default config and context
     pub fn new() -> Self {
-        JournalParser { context: ParseContext::default() }
+        JournalParser { config: JournalParserConfig::default(), context: ParseContext::default() }
+    }
+
+    /// Create a new parser with given config and default context
+    pub fn with_config(config: JournalParserConfig) -> Self {
+        JournalParser { config, context: ParseContext::default() }
     }
 
     /// Create a parser with specified filename
     pub fn with_file<P: AsRef<Path>>(filename: P) -> Self {
         let mut parser = Self::new();
-        parser.context.filename = filename.as_ref().to_path_buf();
+        parser.context.filename = ParseInput::File(filename.as_ref().to_path_buf());
         parser
     }
 
@@ -328,7 +475,7 @@ impl JournalParser {
 
         // Update context
         let old_filename = self.context.filename.clone();
-        self.context.filename = path_buf.clone();
+        self.context.filename = ParseInput::File(path_buf.clone());
         self.context.include_stack.push(path_buf);
 
         // Parse the file
@@ -344,17 +491,18 @@ impl JournalParser {
     /// Parse a complete journal from a string
     pub fn parse_journal(&mut self, input: &str) -> Result<Journal, JournalParseError> {
         let entries = {
-            PARSE_STATE.with_borrow_mut(|c| c.commodity_pool = self.context.commodity_pool.clone());
+            PARSE_STATE.replace(self.context.clone());
             let entries = self.parse_entries(input)?;
-            self.context.commodity_pool = PARSE_STATE.with_borrow_mut(|c| c.commodity_pool.clone());
+            self.context = PARSE_STATE.with_borrow_mut(|c| c.clone());
             entries
         };
-        let journal = self.build_journal(entries)?;
+        let journal = self.build_journal(entries, input)?;
         Ok(journal)
     }
 
     /// Parse entries from input string with enhanced error reporting
     pub fn parse_entries(&mut self, input: &str) -> Result<Vec<JournalEntry>, JournalParseError> {
+        let input = Input::new(input);
         match journal_entries_with_recovery(input, &mut self.context) {
             Ok((_, entries)) => Ok(entries),
             Err(nom::Err::Error(e) | nom::Err::Failure(e)) => {
@@ -382,10 +530,16 @@ impl JournalParser {
     }
 
     /// Build journal from parsed entries
-    fn build_journal(&mut self, entries: Vec<JournalEntry>) -> Result<Journal, JournalParseError> {
+    fn build_journal(
+        &mut self,
+        entries: Vec<JournalEntry>,
+        input: &str,
+    ) -> Result<Journal, JournalParseError> {
         let mut journal = Journal::new();
+        journal.accounts = self.context.accounts.clone();
         journal.commodity_pool = self.context.commodity_pool.clone();
 
+        let mut any_error = false;
         for entry in entries {
             match entry {
                 JournalEntry::Transaction(transaction) => {
@@ -393,11 +547,11 @@ impl JournalParser {
                     self.register_transaction_accounts_and_commodities(&mut journal, &transaction);
 
                     // Validate transaction before adding
-                    match self.validate_transaction(&transaction) {
+                    match self.validate_transaction(&transaction, input) {
                         Ok(_) => journal.add_transaction(transaction),
                         Err(validation_error) => {
-                            // For now, log error and continue - could be made strict
-                            eprintln!("Warning: {}", validation_error);
+                            any_error = self.config.checking_style() == CheckingStyle::Error;
+                            eprintln!("{}", validation_error);
                             journal.add_transaction(transaction);
                         }
                     }
@@ -414,7 +568,17 @@ impl JournalParser {
             }
         }
 
-        Ok(journal)
+        if any_error {
+            // FIXME: this error is "fake", just to signal failure to calling code
+            Err(JournalParseError::ValidationError {
+                filename: ParseInput::File(PathBuf::new()),
+                line: 0,
+                message: String::new(),
+                transaction_description: String::new(),
+            })
+        } else {
+            Ok(journal)
+        }
     }
 
     /// Register accounts and commodities from a transaction
@@ -432,70 +596,9 @@ impl JournalParser {
 
             // Ensure the account exists in the journal
             // This will create it if it doesn't exist
-            let _ = journal.get_or_create_account(&account_name);
-
-            // Register commodity from the amount if present
-            // if let Some(amount) = &posting.amount {
-            //     self.register_commodity_for_amount(amount, journal);
-            //     if let Some(price) =
-            //         amount.commodity().and_then(|c| c.annotation().price().as_ref())
-            //     {
-            //         self.register_commodity_for_amount(price, journal);
-            //     }
-            // }
-            // if let Some(cost) = &posting.given_cost {
-            //     self.register_commodity_for_amount(cost, journal);
-            //     // NOTE: technically, the commodity of a cost could have a
-            //     // price, but I don't believe it ever does in practice
-            // }
+            journal.get_or_create_account(&account_name);
         }
     }
-
-    // fn register_commodity_for_amount(&mut self, amount: &Amount, journal: &mut Journal) {
-    //     if let Some(commodity_ref) = amount.commodity() {
-    //         let new_commodity = commodity_ref.clone();
-    //         let symbol = new_commodity.symbol().to_string();
-
-    //         // Add commodity if it doesn't exist in the journal
-    //         if let Some(previous_commodity) = journal.commodities.get(&symbol) {
-    //             if previous_commodity.precision() < new_commodity.precision()
-    //                 || previous_commodity.flags() != new_commodity.flags()
-    //                 || previous_commodity.annotation() != new_commodity.annotation()
-    //             {
-    //                 // FIXME: this seems messy
-    //                 let mut new_commodity = Arc::unwrap_or_clone(new_commodity);
-
-    //                 if new_commodity.precision() < previous_commodity.precision() {
-    //                     new_commodity.set_precision(previous_commodity.precision());
-    //                 }
-    //                 new_commodity.add_flags(previous_commodity.flags());
-
-    //                 match (
-    //                     new_commodity.annotation().price(),
-    //                     previous_commodity.annotation().price(),
-    //                 ) {
-    //                     (Some(new_commodity_price), Some(previous_commodity_price))
-    //                         if new_commodity_price < previous_commodity_price =>
-    //                     {
-    //                         new_commodity
-    //                             .annotation_mut()
-    //                             .set_price(previous_commodity_price.clone());
-    //                     }
-    //                     (None, Some(previous_commodity_price)) => {
-    //                         new_commodity
-    //                             .annotation_mut()
-    //                             .set_price(previous_commodity_price.clone());
-    //                     }
-    //                     (Some(_), Some(_)) | (Some(_), None) | (None, None) => {}
-    //                 }
-
-    //                 journal.commodities.insert(symbol.clone(), Arc::new(new_commodity));
-    //             }
-    //         } else {
-    //             journal.commodities.insert(symbol.clone(), new_commodity.clone());
-    //         }
-    //     }
-    // }
 
     /// Process a parsed directive with include handling. Happens after entire
     /// journal is parsed. For processing directives during parse, see
@@ -506,8 +609,7 @@ impl JournalParser {
         directive: Directive,
     ) -> Result<(), JournalParseError> {
         match directive {
-            Directive::Account { name, declarations } => {
-                let account = Account::new(name.clone().into(), None, 0);
+            Directive::Account { name: _, declarations } => {
                 for decl in declarations {
                     match decl {
                         AccountDeclaration::Alias(_alias) => {
@@ -521,7 +623,6 @@ impl JournalParser {
                     }
                 }
                 // TODO: error logging
-                let _ = journal.add_account(Rc::new(RefCell::new(account)));
             }
             Directive::Commodity { symbol, declarations } => {
                 let mut commodity = Commodity::new(&symbol);
@@ -596,7 +697,13 @@ impl JournalParser {
         let include_path = if path.is_absolute() {
             path.clone()
         } else {
-            self.context.filename.parent().unwrap_or_else(|| Path::new("")).join(path)
+            match self.context.filename {
+                ParseInput::File(ref path_buf) => {
+                    path_buf.parent().unwrap_or_else(|| Path::new("")).join(path)
+                }
+                // FIXME: probably use cwd
+                ParseInput::StdIn => path.clone(),
+            }
         };
 
         // Parse included file and merge
@@ -621,7 +728,13 @@ impl JournalParser {
             let resolved_path = if path.is_absolute() {
                 path
             } else {
-                self.context.filename.parent().unwrap_or_else(|| Path::new("")).join(&path)
+                match self.context.filename {
+                    ParseInput::File(ref path_buf) => {
+                        path_buf.parent().unwrap_or_else(|| Path::new("")).join(path)
+                    }
+                    // FIXME: probably use cwd
+                    ParseInput::StdIn => path,
+                }
             };
 
             return resolved_path.exists();
@@ -632,10 +745,10 @@ impl JournalParser {
     }
 
     /// Extract detailed error context from parse failure
-    fn extract_error_context(&self, input: &str, error: &VerboseError<&str>) -> ErrorContext {
+    fn extract_error_context(&self, input: Input<'_>, error: &VerboseError<Input>) -> ErrorContext {
         // Get line and column information
         let (line, column) =
-            self.get_line_column(input, error.errors.first().map(|(s, _)| s).unwrap_or(&input));
+            self.get_line_column(input, error.errors.first().map(|(s, _)| *s).unwrap_or(input));
 
         // Extract context around the error
         let context = self.get_error_context_string(input, line, column);
@@ -647,7 +760,7 @@ impl JournalParser {
     }
 
     /// Get line and column from input position
-    fn get_line_column(&self, input: &str, error_pos: &str) -> (usize, usize) {
+    fn get_line_column(&self, input: Input<'_>, error_pos: Input) -> (usize, usize) {
         let error_offset = input.len() - error_pos.len();
         let lines: Vec<&str> = input[..error_offset].lines().collect();
         let error_at_start_of_line =
@@ -660,7 +773,7 @@ impl JournalParser {
     }
 
     /// Get context string around error position
-    fn get_error_context_string(&self, input: &str, line: usize, column: usize) -> String {
+    fn get_error_context_string(&self, input: Input<'_>, line: usize, column: usize) -> String {
         let lines: Vec<&str> = input.lines().collect();
         let mut context = Vec::new();
 
@@ -690,7 +803,7 @@ impl JournalParser {
     /// Generate helpful error messages and suggestions
     fn generate_error_message_and_suggestion(
         &self,
-        error: &VerboseError<&str>,
+        error: &VerboseError<Input>,
     ) -> (String, Option<String>) {
         if let Some((_, kind)) = error.errors.first() {
             match kind {
@@ -718,7 +831,11 @@ impl JournalParser {
     }
 
     /// Validate a transaction for common errors
-    fn validate_transaction(&self, transaction: &Transaction) -> Result<(), JournalParseError> {
+    fn validate_transaction(
+        &self,
+        transaction: &Transaction,
+        input: &str,
+    ) -> Result<(), JournalParseError> {
         // Check for empty transaction
         if transaction.postings.is_empty() {
             return Err(JournalParseError::ValidationError {
@@ -738,6 +855,80 @@ impl JournalParser {
                 message: balance_error.message,
                 difference: balance_error.difference,
             });
+        }
+
+        let filename = match self.config.checking_style() {
+            CheckingStyle::Warn | CheckingStyle::Error => self.context.filename.clone(),
+            CheckingStyle::Permissive | CheckingStyle::Normal => return Ok(()),
+        };
+
+        if !self.context.payees.contains(&transaction.payee) && self.config.check_payees {
+            return Err(JournalParseError::UnknownPayee {
+                filename,
+                line: self.context.line,
+                payee: transaction.payee.clone(),
+                description: input
+                    .lines()
+                    .nth(transaction.location.line() - 1)
+                    .unwrap()
+                    .to_string(),
+            });
+        }
+
+        for tag in transaction.metadata.keys() {
+            if !self.context.tags.contains(tag) {
+                return Err(JournalParseError::UnknownTag {
+                    filename,
+                    line: transaction.location.line(),
+                    tag: tag.to_string(),
+                });
+            }
+        }
+
+        for posting in transaction.postings.iter() {
+            if !posting.account.borrow().has_flag(AccountFlags::Known) {
+                return Err(JournalParseError::UnknownAccount {
+                    filename,
+                    line: posting.location.line(),
+                    posting: input.lines().nth(posting.location.line() - 1).unwrap().to_string(),
+                    account: posting.account.borrow().fullname_immutable(),
+                });
+            }
+
+            if let Some(commodity) = posting.amount.as_ref().and_then(|a| a.commodity()) {
+                if !commodity.has_flags(CommodityFlags::KNOWN) {
+                    let posting_line =
+                        input.lines().nth(posting.location.line() - 1).unwrap().trim_start();
+                    let highlight_offset = if let Some(offset) = posting_line.rfind("  ") {
+                        offset + 2
+                    } else if let Some(offset) = posting_line.rfind('\t') {
+                        offset + 1
+                    } else {
+                        0
+                    };
+                    return Err(JournalParseError::UnknownCommodity {
+                        filename,
+                        line: posting.location.line(),
+                        posting: format!("  {posting_line}"),
+                        highlight: format!(
+                            "{}{}",
+                            " ".repeat(highlight_offset + 2),
+                            "^".repeat(posting_line.len() - highlight_offset)
+                        ),
+                        commodity: commodity.symbol().to_string(),
+                    });
+                }
+            }
+
+            for tag in posting.metadata.keys() {
+                if !self.context.tags.contains(tag) {
+                    return Err(JournalParseError::UnknownTag {
+                        filename,
+                        line: posting.location.line(),
+                        tag: tag.to_string(),
+                    });
+                }
+            }
         }
 
         Ok(())
@@ -1039,15 +1230,9 @@ struct TransactionBalanceError {
     difference: String,
 }
 
-/// Parse complete journal entries
-#[allow(dead_code)]
-fn journal_entries(input: &str) -> ParseResult<'_, Vec<JournalEntry>> {
-    many0(journal_entry)(input)
-}
-
-/// Parse complete journal entries with error recovery
+/// Parse complete journal entries, with error recovery
 fn journal_entries_with_recovery<'a>(
-    input: &'a str,
+    input: LocatedSpan<&'a str>, // aka Input
     context: &mut ParseContext,
 ) -> ParseResult<'a, Vec<JournalEntry>> {
     let mut entries = Vec::new();
@@ -1064,7 +1249,7 @@ fn journal_entries_with_recovery<'a>(
             Err(nom::Err::Error(_) | nom::Err::Failure(_)) => {
                 // Try to recover by skipping to next line
                 if let Some(newline_pos) = remaining.find('\n') {
-                    remaining = &remaining[newline_pos + 1..];
+                    remaining = remaining.slice(newline_pos + 1..);
                     context.line += 1;
                     context.column = 1;
                 } else {
@@ -1083,7 +1268,7 @@ fn journal_entries_with_recovery<'a>(
 }
 
 /// Parse a single journal entry with error recovery
-fn journal_entry_with_recovery(input: &str) -> ParseResult<'_, Option<JournalEntry>> {
+fn journal_entry_with_recovery(input: Input<'_>) -> ParseResult<'_, Option<JournalEntry>> {
     alt((
         map(journal_entry, Some),
         // Skip invalid lines and return None
@@ -1092,16 +1277,17 @@ fn journal_entry_with_recovery(input: &str) -> ParseResult<'_, Option<JournalEnt
 }
 
 /// Skip an invalid line for error recovery
-fn skip_invalid_line(input: &str) -> ParseResult<'_, &str> {
+fn skip_invalid_line(input: Input<'_>) -> ParseResult<'_, Input<'_>> {
     terminated(take_until("\n"), line_ending)(input)
 }
 
 /// Parse a single journal entry
-fn journal_entry(input: &str) -> ParseResult<'_, JournalEntry> {
+fn journal_entry(input: Input<'_>) -> ParseResult<'_, JournalEntry> {
     alt((
         map(transaction_entry, JournalEntry::Transaction),
         map(directive_entry, JournalEntry::Directive),
-        map(enhanced_comment_line, |(comment, metadata)| {
+        map(comment, |comment| {
+            let metadata = parse_metadata_tags(&comment, None);
             if metadata.is_empty() {
                 JournalEntry::Comment(comment)
             } else {
@@ -1113,109 +1299,101 @@ fn journal_entry(input: &str) -> ParseResult<'_, JournalEntry> {
 }
 
 /// Parse an empty line
-fn empty_line(input: &str) -> ParseResult<'_, &str> {
+fn empty_line(input: Input<'_>) -> ParseResult<'_, Input<'_>> {
     terminated(space0, line_ending)(input)
-}
-
-/// Parse a comment line with optional metadata extraction
-#[allow(dead_code)]
-fn comment_line(input: &str) -> ParseResult<'_, String> {
-    map(preceded(alt((tag(";"), tag("#"), tag("*"), tag("|"))), take_until("\n")), |s: &str| {
-        s.to_string()
-    })(input)
 }
 
 /// Parse metadata tags from comments with multiple supported patterns
 fn parse_metadata_tags(
     comment: &str,
-    metadata: Option<HashMap<String, String>>,
-) -> HashMap<String, String> {
+    metadata: Option<HashMap<String, TagData>>,
+) -> HashMap<String, TagData> {
     let mut metadata = metadata.unwrap_or_default();
 
     for line in comment.lines() {
-        let mut trimmed = line.trim();
+        let line = line.trim();
+        let parts: Vec<_> = line.split(":").collect();
 
-        while !trimmed.is_empty() {
-            // Pattern 1: :tag: value
-            if let Some(start) = trimmed.find(':') {
-                if let Some(end) = trimmed[start + 1..].find(':') {
-                    let tag_name = &trimmed[start + 1..start + 1 + end];
-                    // +2 because of the leading/trailing colons
-                    let remaining = &trimmed[tag_name.len() + 2..].trim();
+        match parts.as_slice() {
+            // empty comment or no colons => no tags
+            [] | [_] => {}
 
-                    let value_end_pos = remaining.find(' ').unwrap_or(remaining.len());
+            // single, simple tag, eg :foo:
+            [first, maybe_tag, last] if first.is_empty() && last.is_empty() => {
+                if !maybe_tag.contains(" ") {
+                    metadata.insert(maybe_tag.to_string(), TagData::empty());
+                }
+            }
 
-                    let value = remaining[..value_end_pos].trim();
+            // 2 adjacent colons => typed tag, eg tag:: [date]
+            [maybe_tag, "", maybe_value] => {
+                if !maybe_tag.contains(" ") {
+                    metadata.insert(maybe_tag.to_string(), TagData::new(maybe_value.trim()));
+                }
+            }
 
-                    if !tag_name.is_empty() {
-                        if value.is_empty() {
-                            metadata.insert(tag_name.to_string(), String::new());
+            // one colon => key:value
+            [maybe_tag, maybe_value] => {
+                if !maybe_tag.contains(" ") {
+                    metadata.insert(maybe_tag.to_string(), TagData::new(maybe_value.trim()));
+                }
+            }
+
+            // edge cases: tag and/or value contains colons
+            [first_part, ..] if !first_part.is_empty() && first_part.trim_end() == *first_part => {
+                let mut tag_parts = vec![first_part];
+                let mut value_parts = vec![];
+                for part in parts.iter().skip(1) {
+                    if value_parts.is_empty() && !part.contains(" ") {
+                        tag_parts.push(part);
+                    } else {
+                        value_parts.push(part);
+                    }
+                }
+
+                let tag = tag_parts.into_iter().cloned().collect::<Vec<_>>().join(":");
+                let value = value_parts.into_iter().cloned().collect::<Vec<_>>().join(":");
+                metadata.insert(tag, TagData::new(value.trim()));
+            }
+
+            [..] => {
+                // could be chain of tags
+                // :tag:tag:
+                // word :tag:tag:
+                // NOTE word:tag:tag: is actually tag `word:tag:tag`
+                // if end of part 1 is not empty or w/s, then it's a key:value
+                // - "word :foo:" would be "word "
+                // - ":tag:" would be ""
+                // - "word:tag" would be "word"
+
+                let mut found_one = false;
+                for part in parts {
+                    if part.is_empty() {
+                        // eg leading or trailing segment
+                        continue;
+                    }
+
+                    if part.contains(" ") {
+                        if found_one {
+                            break;
                         } else {
-                            metadata.insert(tag_name.to_string(), value.to_string());
+                            continue;
                         }
                     }
 
-                    trimmed = remaining[value_end_pos..].trim();
-                    continue;
+                    metadata.insert(part.to_string(), TagData::empty());
+                    found_one = true;
                 }
             }
-
-            // Pattern 2: [key: value] or [key=value]
-            if let Some(start) = trimmed.find('[') {
-                if let Some(end) = trimmed.find(']') {
-                    let bracket_content = &trimmed[start + 1..end];
-                    metadata = parse_metadata_tags(bracket_content, Some(metadata));
-
-                    trimmed = trimmed[bracket_content.len() + 2..].trim();
-                    continue;
-                }
-            }
-
-            // Pattern 3: key: value
-            if trimmed.chars().filter(|&c| c == ':').count() == 1 {
-                if let Some(equals_pos) = trimmed.find(": ") {
-                    let key = trimmed[..equals_pos].trim();
-                    let remaining = &trimmed[equals_pos + 2..];
-                    let value_end_pos = remaining.find(' ').unwrap_or(remaining.len());
-
-                    let value = remaining[..value_end_pos].trim();
-                    if !key.is_empty() && !key.contains(' ') {
-                        metadata.insert(key.to_string(), value.to_string());
-                    }
-                    trimmed = remaining[value_end_pos..].trim();
-                    continue;
-                }
-            }
-
-            // Pattern 4: key=value (no brackets/colons)
-            if trimmed.contains('=') {
-                if let Some(equals_pos) = trimmed.find('=') {
-                    let key = trimmed[..equals_pos].trim();
-                    let value_end_pos = trimmed.find(' ').unwrap_or(trimmed.len());
-
-                    let value = trimmed[equals_pos + 1..value_end_pos].trim();
-                    if !key.is_empty() && !key.contains(' ') {
-                        metadata.insert(key.to_string(), value.to_string());
-                    }
-                    trimmed = trimmed[value_end_pos..].trim();
-                    continue;
-                }
-            }
-
-            break;
         }
     }
 
     metadata
 }
 
-/// Enhanced comment parser with metadata extraction
-fn enhanced_comment_line(input: &str) -> ParseResult<'_, (String, HashMap<String, String>)> {
-    map(preceded(alt((tag(";"), tag("#"), tag("*"), tag("|"))), take_until("\n")), |s: &str| {
-        let comment = s.to_string();
-        let metadata = parse_metadata_tags(&comment, None);
-        (comment, metadata)
-    })(input)
+/// Parse a comment
+fn comment(input: Input<'_>) -> ParseResult<'_, String> {
+    map(preceded(is_a(";#*|"), take_until("\n")), |s: Input| s.trim().to_string())(input)
 }
 
 // ============================================================================
@@ -1223,12 +1401,12 @@ fn enhanced_comment_line(input: &str) -> ParseResult<'_, (String, HashMap<String
 // ============================================================================
 
 /// Parse a transaction entry
-fn transaction_entry(input: &str) -> ParseResult<'_, Transaction> {
+fn transaction_entry(input: Input<'_>) -> ParseResult<'_, Transaction> {
     context("transaction", parse_transaction)(input)
 }
 
 /// Parse a complete transaction with metadata support
-fn parse_transaction(input: &str) -> ParseResult<'_, Transaction> {
+fn parse_transaction(input: Input<'_>) -> ParseResult<'_, Transaction> {
     let mut parser = tuple((
         date_field,
         opt(preceded(tag("="), date_field)), // aux date
@@ -1240,10 +1418,10 @@ fn parse_transaction(input: &str) -> ParseResult<'_, Transaction> {
         opt(payee_description),
         space0,
         // transaction comment on payee line
-        opt(simple_comment_field),
+        opt(comment),
         line_ending,
         // transaction comments between payees and postings
-        many0(delimited(alt((space1, tag("\t"))), simple_comment_field, line_ending)),
+        many0(delimited(alt((space1, tag("\t"))), comment, line_ending)),
         many0(posting_line),
     ));
 
@@ -1251,14 +1429,18 @@ fn parse_transaction(input: &str) -> ParseResult<'_, Transaction> {
         parser(input)?;
 
     let payee_str = payee.unwrap_or_else(String::new);
-    let mut transaction = Transaction::new(date, payee_str);
+    let mut transaction =
+        Transaction::new(date, payee_str).at_location(JournalLocation::FileAndLine {
+            filename: PARSE_STATE.with(|s| s.borrow().filename.clone()),
+            line: input.location_line() as usize,
+        });
 
     if let Some(aux_date) = aux_date {
         transaction.set_aux_date(Some(aux_date));
     }
 
     if let Some(cleared) = cleared {
-        match cleared {
+        match *cleared {
             "*" => transaction.set_status(crate::transaction::TransactionStatus::Cleared),
             "!" => transaction.set_status(crate::transaction::TransactionStatus::Pending),
             _ => {}
@@ -1277,11 +1459,11 @@ fn parse_transaction(input: &str) -> ParseResult<'_, Transaction> {
         transaction.note = Some(comment);
 
         if let Some(payee) = metadata.get("Payee") {
-            transaction.payee = payee.clone();
+            if let Some(ref payee) = payee.value {
+                transaction.payee = payee.clone();
+            }
         }
 
-        let metadata: HashMap<String, TagData> =
-            metadata.into_iter().map(|(key, value)| (key, TagData::new(value))).collect();
         transaction.metadata.extend(metadata);
     }
 
@@ -1293,20 +1475,20 @@ fn parse_transaction(input: &str) -> ParseResult<'_, Transaction> {
 }
 
 /// Parse a date field
-fn date_field(input: &str) -> ParseResult<'_, NaiveDate> {
+fn date_field(input: Input<'_>) -> ParseResult<'_, NaiveDate> {
     let date_with_optional_year = |sep| {
         tuple((
-            opt(terminated(verify(digit1, |s: &str| s.len() == 4), tag(sep))),
-            terminated(verify(digit1, |s: &str| (1..=2).contains(&s.len())), tag(sep)),
-            terminated(verify(digit1, |s: &str| (1..=2).contains(&s.len())), not(tag(sep))),
+            opt(terminated(verify(digit1::<Input, _>, |s: &Input| s.len() == 4), char(sep))),
+            terminated(verify(digit1, |s: &Input| (1..=2).contains(&s.len())), char(sep)),
+            terminated(verify(digit1, |s: &Input| (1..=2).contains(&s.len())), not(char(sep))),
         ))
     };
 
     map(
         alt((
-            date_with_optional_year("/"),
-            date_with_optional_year("-"),
-            date_with_optional_year("."),
+            date_with_optional_year('/'),
+            date_with_optional_year('-'),
+            date_with_optional_year('.'),
         )),
         |(year, month, day)| {
             let default_year = PARSE_STATE
@@ -1326,17 +1508,17 @@ fn date_field(input: &str) -> ParseResult<'_, NaiveDate> {
 }
 
 /// Parse payee description
-fn payee_description(input: &str) -> ParseResult<'_, String> {
-    map(is_not("\r\n;"), |s: &str| s.trim().to_string())(input)
+fn payee_description(input: Input<'_>) -> ParseResult<'_, String> {
+    map(is_not("\r\n;"), |s: Input| s.trim().to_string())(input)
 }
 
 /// Parse a posting line
-fn posting_line(input: &str) -> ParseResult<'_, Posting> {
+fn posting_line(input: Input<'_>) -> ParseResult<'_, Posting> {
     context("posting", preceded(alt((space1, tag("\t"))), parse_posting))(input)
 }
 
 /// Parse a single posting with metadata support
-pub(crate) fn parse_posting(input: &str) -> ParseResult<'_, Posting> {
+pub(crate) fn parse_posting(input: Input<'_>) -> ParseResult<'_, Posting> {
     // For now, create a simplified version that compiles
     // TODO: Fix account reference creation and metadata handling
     let mut parser = tuple((
@@ -1363,21 +1545,17 @@ pub(crate) fn parse_posting(input: &str) -> ParseResult<'_, Posting> {
                 amount_with_minimum_precision,
             )),
         ))),
-        opt(preceded(space0, simple_comment_field)),
+        opt(preceded(space0, comment)),
         opt(line_ending),
     ));
 
     let (rest, (account, amount_price_cost, comment, _)) = parser(input)?;
 
-    // Create a dummy account reference for now
     // TODO: Proper account management
-    use compact_str::CompactString;
-    let account_ref = std::rc::Rc::new(std::cell::RefCell::new(crate::account::Account::new(
-        CompactString::from(account),
-        None,
-        0,
-    )));
-    let mut posting = Posting::new(account_ref);
+    let account_ref = PARSE_STATE.with_borrow_mut(|state| state.find_or_create_account(&account));
+
+    let mut posting = Posting::new(account_ref)
+        .at_location(JournalLocation::Line(input.location_line() as usize));
 
     if let Some((mut amount, lot_price, cost)) = amount_price_cost {
         if let Some((calculate_price, mut price)) = lot_price {
@@ -1415,17 +1593,17 @@ pub(crate) fn parse_posting(input: &str) -> ParseResult<'_, Posting> {
 
     // TODO: confirm that amount.commodity != given_cost.commodity
 
-    if let Some(comment) = comment {
-        use compact_str::CompactString;
+    if let Some(ref comment) = comment {
         posting.note = Some(CompactString::from(comment));
+        posting.metadata = parse_metadata_tags(comment, None);
     }
 
     Ok((rest, posting))
 }
 
 /// Parse an account name
-fn account_name(input: &str) -> ParseResult<'_, String> {
-    fn parse_account_name(input: &str) -> IResult<&str, &str, VerboseError<&str>> {
+fn account_name(input: Input<'_>) -> ParseResult<'_, String> {
+    fn parse_account_name(input: Input<'_>) -> ParseResult<'_, Input<'_>> {
         let mut last_char_was_space = false;
         for (i, char) in input.char_indices() {
             match char {
@@ -1433,11 +1611,13 @@ fn account_name(input: &str) -> ParseResult<'_, String> {
                     return Err(nom::Err::Incomplete(nom::Needed::new(1)));
                 }
                 '\t' | '\n' | ';' | ' ' if last_char_was_space => {
-                    let (parsed, rest) = input.split_at(i - 1);
+                    let parsed = input.slice(..i - 1);
+                    let rest = input.slice(i - 1..);
                     return Ok((rest, parsed));
                 }
                 '\t' | '\n' | ';' => {
-                    let (parsed, rest) = input.split_at(i);
+                    let parsed = input.slice(..i);
+                    let rest = input.slice(i..);
                     return Ok((rest, parsed));
                 }
                 _ => {
@@ -1446,20 +1626,21 @@ fn account_name(input: &str) -> ParseResult<'_, String> {
             }
         }
 
-        Ok(("", input))
+        let i = input.len();
+        Ok((input.slice(i..), input.slice(..i)))
     }
 
-    map(parse_account_name, |s: &str| s.trim().to_string())(input)
+    map(parse_account_name, |s| s.trim().to_string())(input)
 }
 
 /// Parse a commodity
-fn commodity_symbol(input: &str) -> ParseResult<'_, String> {
+fn commodity_symbol(input: Input<'_>) -> ParseResult<'_, String> {
     // Ref invalid_chars in commodity.cc
     let invalid_commodity_chars = " \t\r\n0123456789.,;:?!-+*/^&|=<>{}[]()@";
 
     alt((
         map(tuple((char('"'), is_not("\""), char('"'))), |(_, c, _)| format!(r#""{c}""#)),
-        map(is_not(invalid_commodity_chars), str::to_string),
+        map(is_not(invalid_commodity_chars), |s: Input| s.to_string()),
     ))(input)
 }
 
@@ -1489,11 +1670,11 @@ enum DecimalFormat {
     US,
 }
 
-fn quantity(input: &str) -> IResult<&str, ParsedQuantity, VerboseError<&str>> {
+fn quantity(input: Input<'_>) -> ParseResult<'_, ParsedQuantity> {
     quantity_impl(input, QuantityFieldOptions::default())
 }
 
-fn quantity_with_full_precision(input: &str) -> IResult<&str, ParsedQuantity, VerboseError<&str>> {
+fn quantity_with_full_precision(input: Input<'_>) -> ParseResult<'_, ParsedQuantity> {
     quantity_impl(input, QuantityFieldOptions { keep_full_precision: true, format_hint: None })
 }
 
@@ -1504,9 +1685,9 @@ struct QuantityFieldOptions {
 }
 
 fn quantity_impl(
-    input: &str,
+    input: Input<'_>,
     options: QuantityFieldOptions,
-) -> IResult<&str, ParsedQuantity, VerboseError<&str>> {
+) -> ParseResult<'_, ParsedQuantity> {
     debug!("quantity_impl: {:?} {:?}", input, &options);
 
     let number_with_separator_and_decimal = |format| {
@@ -1522,7 +1703,11 @@ fn quantity_impl(
                 ),
                 move |(leading, rest)| {
                     (
-                        format!("{}{}", leading, rest.join("")),
+                        format!(
+                            "{}{}",
+                            leading,
+                            rest.iter().map(|s: &Input| *s.fragment()).collect::<Vec<_>>().join("")
+                        ),
                         match format {
                             DecimalFormat::Euro => Some(
                                 CommodityFlags::STYLE_DECIMAL_COMMA
@@ -1555,7 +1740,14 @@ fn quantity_impl(
                     ),
                     move |(leading, rest)| {
                         (
-                            format!("{}{}", leading, rest.join("")),
+                            format!(
+                                "{}{}",
+                                leading,
+                                rest.iter()
+                                    .map(|s: &Input| *s.fragment())
+                                    .collect::<Vec<_>>()
+                                    .join("")
+                            ),
                             match format {
                                 DecimalFormat::Euro => Some(
                                     CommodityFlags::STYLE_DECIMAL_COMMA
@@ -1566,7 +1758,7 @@ fn quantity_impl(
                         )
                     },
                 ),
-                success(""),
+                success(Input::new("")), // no decimal portion
                 success(ParsedQuantityFormat::ThousandsNoDecimal),
                 success(format),
             )),
@@ -1580,7 +1772,7 @@ fn quantity_impl(
             DecimalFormat::Euro => ',',
         };
         tuple((
-            map(digit1, move |s: &str| {
+            map(digit1, move |s: Input| {
                 (
                     s.to_string(),
                     match format {
@@ -1595,8 +1787,8 @@ fn quantity_impl(
         ))
     };
     let number_without_separator_or_decimal = tuple((
-        map(digit1, |s: &str| (s.to_string(), None)),
-        success(""), // no decimal portion
+        map(digit1, |s: Input| (s.to_string(), None)),
+        success(Input::new("")), // no decimal portion
         success(ParsedQuantityFormat::NoThousandsNorDecimal),
         success(DecimalFormat::US),
     ));
@@ -1637,13 +1829,13 @@ fn quantity_impl(
 
     let (rest, (matched, (maybe_sign, _, ((integer, flags), fraction, format, decimal_format)))) =
         result?;
-    let mut decimal_str = format!("{sign}{integer}", sign = maybe_sign.unwrap_or(""));
+    let mut decimal_str = format!("{sign}{integer}", sign = maybe_sign.unwrap_or("".into()));
 
     if !fraction.is_empty() {
         let fraction = if options.keep_full_precision {
-            fraction
+            *fraction
         } else {
-            fraction.strip_suffix("0").unwrap_or(fraction)
+            fraction.strip_suffix("0").unwrap_or(*fraction)
         };
 
         decimal_str.push('.');
@@ -1664,19 +1856,19 @@ fn quantity_impl(
 
 // See C++ version, these use migrate_format_to_commodity: false
 fn _cost_amount(input: &str) -> ParseResult<'_, Amount> {
-    amount_field_impl(input, AmountFieldOptions::default())
+    amount_field_impl(Input::new(input), AmountFieldOptions::default())
 }
 fn _balance_assertion_amount(input: &str) -> ParseResult<'_, Amount> {
-    amount_field_impl(input, AmountFieldOptions::default())
+    amount_field_impl(Input::new(input), AmountFieldOptions::default())
 }
 
-fn default_commodity_amount(input: &str) -> ParseResult<'_, Amount> {
+fn default_commodity_amount(input: Input<'_>) -> ParseResult<'_, Amount> {
     amount_field_impl(
         input,
         AmountFieldOptions { migrate_format_to_commodity: true, keep_full_precision: true },
     )
 }
-fn amount_with_minimum_precision(input: &str) -> ParseResult<'_, Amount> {
+fn amount_with_minimum_precision(input: Input<'_>) -> ParseResult<'_, Amount> {
     amount_field_impl(
         input,
         AmountFieldOptions { migrate_format_to_commodity: true, keep_full_precision: false },
@@ -1685,7 +1877,7 @@ fn amount_with_minimum_precision(input: &str) -> ParseResult<'_, Amount> {
 
 /// Parse a simple amount field, containing a quantity (number) and commodity
 /// (symbol), in any order.
-fn simple_amount_field(input: &str) -> ParseResult<'_, Amount> {
+fn simple_amount_field(input: Input<'_>) -> ParseResult<'_, Amount> {
     amount_field_impl(
         input,
         AmountFieldOptions { migrate_format_to_commodity: true, keep_full_precision: true },
@@ -1698,7 +1890,7 @@ struct AmountFieldOptions {
     keep_full_precision: bool,
 }
 
-fn amount_field_impl(input: &str, options: AmountFieldOptions) -> ParseResult<'_, Amount> {
+fn amount_field_impl(input: Input<'_>, options: AmountFieldOptions) -> ParseResult<'_, Amount> {
     debug!("amount_field_impl: {:?} {:?}", input, &options);
 
     let quantity_field =
@@ -1756,16 +1948,7 @@ fn amount_field_impl(input: &str, options: AmountFieldOptions) -> ParseResult<'_
     debug!("detected cmdty: {:?}", &commodity_symbol);
 
     let commodity = if let Some(commodity_symbol) = commodity_symbol {
-        let commodity =
-            PARSE_STATE.with_borrow_mut(|c| c.commodity_pool.find_or_create(&commodity_symbol));
-        if ["€", "$"].contains(&commodity.symbol()) {
-            debug!(
-                "existing cmdty: {} {} {:#?}",
-                commodity.symbol(),
-                commodity.precision(),
-                commodity.flags()
-            );
-        }
+        let commodity = PARSE_STATE.with_borrow_mut(|c| c.register_commodity(&commodity_symbol));
 
         let existing_format_is_euro = commodity.has_flags(CommodityFlags::STYLE_DECIMAL_COMMA);
         let try_format = match quantity.decimal_format {
@@ -1788,7 +1971,7 @@ fn amount_field_impl(input: &str, options: AmountFieldOptions) -> ParseResult<'_
                     && possible_incorrect_parse =>
             {
                 if let Ok((_, quantity_retry)) = quantity_impl(
-                    &quantity.input,
+                    Input::new(&quantity.input),
                     QuantityFieldOptions {
                         keep_full_precision: options.keep_full_precision,
                         format_hint: Some(try_format),
@@ -1870,32 +2053,17 @@ fn amount_field_impl(input: &str, options: AmountFieldOptions) -> ParseResult<'_
     Ok((rest, amount))
 }
 
-/// Parse a comment field with metadata extraction
-#[allow(dead_code)]
-fn comment_field(input: &str) -> ParseResult<'_, (String, HashMap<String, String>)> {
-    map(preceded(tag(";"), take_until("\n")), |s: &str| {
-        let comment = s.trim().to_string();
-        let metadata = parse_metadata_tags(&comment, None);
-        (comment, metadata)
-    })(input)
-}
-
-/// Simple comment field parser (for backward compatibility)
-fn simple_comment_field(input: &str) -> ParseResult<'_, String> {
-    map(preceded(tag(";"), take_until("\n")), |s: &str| s.trim().to_string())(input)
-}
-
 // ============================================================================
 // Directive Parsing
 // ============================================================================
 
 /// Parse a directive entry
-fn directive_entry(input: &str) -> ParseResult<'_, Directive> {
+fn directive_entry(input: Input<'_>) -> ParseResult<'_, Directive> {
     context("directive", parse_directive)(input)
 }
 
 /// Parse any directive
-fn parse_directive(input: &str) -> ParseResult<'_, Directive> {
+fn parse_directive(input: Input<'_>) -> ParseResult<'_, Directive> {
     map(
         alt((
             account_directive,
@@ -1932,19 +2100,39 @@ fn process_directive_inline(directive: Directive) -> Directive {
                 .with_borrow_mut(|c| c.commodity_pool.set_default_commodity(commodity.clone()));
         }
 
+        Directive::Account { ref name, declarations: _ } => {
+            PARSE_STATE.with_borrow_mut(|state| {
+                state.create_known_account(name);
+            });
+        }
+
+        Directive::Commodity { ref symbol, declarations: _ } => {
+            PARSE_STATE.with_borrow_mut(|state| {
+                state.create_known_commodity(symbol);
+            });
+        }
+
+        Directive::Payee { ref name, declarations: _ } => {
+            PARSE_STATE.with_borrow_mut(|state| {
+                state.create_known_payee(name);
+            });
+        }
+
+        Directive::Tag { ref name } => {
+            PARSE_STATE.with_borrow_mut(|state| {
+                state.create_known_tag(name);
+            });
+        }
+
         // no inline processing for these directives
-        Directive::Account { .. }
-        | Directive::Alias { .. }
+        Directive::Alias { .. }
         | Directive::Apply { .. }
         | Directive::End
         | Directive::Assert { .. }
         | Directive::Check { .. }
-        | Directive::Commodity { .. }
         | Directive::Price { .. }
         | Directive::Include { .. }
         | Directive::ConditionalInclude { .. }
-        | Directive::Payee { .. }
-        | Directive::Tag { .. }
         | Directive::Option { .. }
         | Directive::Eval { .. }
         | Directive::Define { .. }
@@ -1955,7 +2143,7 @@ fn process_directive_inline(directive: Directive) -> Directive {
 }
 
 /// Parse account directive
-fn account_directive(input: &str) -> ParseResult<'_, Directive> {
+fn account_directive(input: Input<'_>) -> ParseResult<'_, Directive> {
     map(
         tuple((tag("account"), space1, account_name, line_ending, many0(account_declaration))),
         |(_, _, name, _, declarations)| Directive::Account { name, declarations },
@@ -1963,14 +2151,14 @@ fn account_directive(input: &str) -> ParseResult<'_, Directive> {
 }
 
 /// Parse account declarations
-fn account_declaration(input: &str) -> ParseResult<'_, AccountDeclaration> {
+fn account_declaration(input: Input<'_>) -> ParseResult<'_, AccountDeclaration> {
     preceded(
         alt((space1, tag("\t"))),
         alt((
-            map(preceded(tag("alias"), preceded(space1, take_until("\n"))), |alias: &str| {
+            map(preceded(tag("alias"), preceded(space1, take_until("\n"))), |alias: Input| {
                 AccountDeclaration::Alias(alias.trim().to_string())
             }),
-            map(preceded(tag("payee"), preceded(space1, take_until("\n"))), |payee: &str| {
+            map(preceded(tag("payee"), preceded(space1, take_until("\n"))), |payee: Input| {
                 AccountDeclaration::Payee(payee.trim().to_string())
             }),
             value(AccountDeclaration::Default, tag("default")),
@@ -1979,7 +2167,7 @@ fn account_declaration(input: &str) -> ParseResult<'_, AccountDeclaration> {
 }
 
 /// Parse commodity directive
-fn commodity_directive(input: &str) -> ParseResult<'_, Directive> {
+fn commodity_directive(input: Input<'_>) -> ParseResult<'_, Directive> {
     map(
         tuple((
             tag("commodity"),
@@ -1996,14 +2184,14 @@ fn commodity_directive(input: &str) -> ParseResult<'_, Directive> {
 }
 
 /// Parse commodity declarations
-fn commodity_declaration(input: &str) -> ParseResult<'_, CommodityDeclaration> {
+fn commodity_declaration(input: Input<'_>) -> ParseResult<'_, CommodityDeclaration> {
     preceded(
         alt((space1, tag("\t"))),
         alt((
-            map(preceded(tag("alias"), preceded(space1, take_until("\n"))), |alias: &str| {
+            map(preceded(tag("alias"), preceded(space1, take_until("\n"))), |alias: Input| {
                 CommodityDeclaration::Alias(alias.trim().to_string())
             }),
-            map(preceded(tag("format"), preceded(space1, take_until("\n"))), |format: &str| {
+            map(preceded(tag("format"), preceded(space1, take_until("\n"))), |format: Input| {
                 CommodityDeclaration::Format(format.trim().to_string())
             }),
             value(CommodityDeclaration::NoMarket, tag("nomarket")),
@@ -2013,23 +2201,23 @@ fn commodity_declaration(input: &str) -> ParseResult<'_, CommodityDeclaration> {
 }
 
 /// Parse include directive
-fn include_directive(input: &str) -> ParseResult<'_, Directive> {
+fn include_directive(input: Input<'_>) -> ParseResult<'_, Directive> {
     alt((conditional_include_directive, simple_include_directive))(input)
 }
 
 /// Parse simple include directive
-fn simple_include_directive(input: &str) -> ParseResult<'_, Directive> {
-    map(preceded(tag("include"), preceded(space1, take_until("\n"))), |path: &str| {
+fn simple_include_directive(input: Input<'_>) -> ParseResult<'_, Directive> {
+    map(preceded(tag("include"), preceded(space1, take_until("\n"))), |path: Input| {
         Directive::Include { path: PathBuf::from(path.trim()) }
     })(input)
 }
 
 /// Parse conditional include directive
-fn conditional_include_directive(input: &str) -> ParseResult<'_, Directive> {
+fn conditional_include_directive(input: Input<'_>) -> ParseResult<'_, Directive> {
     map(
         tuple((
             tag("include"),
-            space1,
+            space1::<Input, _>,
             delimited(tag("["), take_until("]"), tag("]")),
             space1,
             take_until("\n"),
@@ -2042,7 +2230,7 @@ fn conditional_include_directive(input: &str) -> ParseResult<'_, Directive> {
 }
 
 /// Parse price directive
-fn price_directive(input: &str) -> ParseResult<'_, Directive> {
+fn price_directive(input: Input<'_>) -> ParseResult<'_, Directive> {
     map(
         tuple((tag("P"), space1, date_field, space1, take_until(" "), space1, simple_amount_field)),
         |(_, _, date, _, commodity, _, price)| Directive::Price {
@@ -2054,9 +2242,9 @@ fn price_directive(input: &str) -> ParseResult<'_, Directive> {
 }
 
 /// Parse alias directive
-fn alias_directive(input: &str) -> ParseResult<'_, Directive> {
+fn alias_directive(input: Input<'_>) -> ParseResult<'_, Directive> {
     map(
-        tuple((tag("alias"), space1, take_until("="), tag("="), take_until("\n"))),
+        tuple((tag("alias"), space1::<Input, _>, take_until("="), tag("="), take_until("\n"))),
         |(_, _, account, _, alias)| Directive::Alias {
             account: account.trim().to_string(),
             alias: alias.trim().to_string(),
@@ -2065,19 +2253,19 @@ fn alias_directive(input: &str) -> ParseResult<'_, Directive> {
 }
 
 /// Parse apply directive
-fn apply_directive(input: &str) -> ParseResult<'_, Directive> {
-    map(preceded(tag("apply account"), preceded(space1, take_until("\n"))), |account: &str| {
-        Directive::Apply { state: ApplyState::Account(account.trim().to_string()) }
+fn apply_directive(input: Input<'_>) -> ParseResult<'_, Directive> {
+    map(preceded(tag("apply account"), preceded(space1, take_until("\n"))), |account: Input| {
+        Directive::Apply { state: ApplyState::Account(account.fragment().trim().to_string()) }
     })(input)
 }
 
 /// Parse end directive
-fn end_directive(input: &str) -> ParseResult<'_, Directive> {
+fn end_directive(input: Input<'_>) -> ParseResult<'_, Directive> {
     value(Directive::End, tag("end"))(input)
 }
 
 /// Parse payee directive
-fn payee_directive(input: &str) -> ParseResult<'_, Directive> {
+fn payee_directive(input: Input<'_>) -> ParseResult<'_, Directive> {
     map(
         tuple((tag("payee"), space1, take_until("\n"), line_ending, many0(payee_declaration))),
         |(_, _, name, _, declarations)| Directive::Payee {
@@ -2088,14 +2276,14 @@ fn payee_directive(input: &str) -> ParseResult<'_, Directive> {
 }
 
 /// Parse payee declarations
-fn payee_declaration(input: &str) -> ParseResult<'_, PayeeDeclaration> {
+fn payee_declaration(input: Input<'_>) -> ParseResult<'_, PayeeDeclaration> {
     preceded(
         alt((space1, tag("\t"))),
         alt((
-            map(preceded(tag("alias"), preceded(space1, take_until("\n"))), |alias: &str| {
+            map(preceded(tag("alias"), preceded(space1, take_until("\n"))), |alias: Input| {
                 PayeeDeclaration::Alias(alias.trim().to_string())
             }),
-            map(preceded(tag("uuid"), preceded(space1, take_until("\n"))), |uuid: &str| {
+            map(preceded(tag("uuid"), preceded(space1, take_until("\n"))), |uuid: Input| {
                 PayeeDeclaration::Uuid(uuid.trim().to_string())
             }),
         )),
@@ -2103,16 +2291,16 @@ fn payee_declaration(input: &str) -> ParseResult<'_, PayeeDeclaration> {
 }
 
 /// Parse tag directive
-fn tag_directive(input: &str) -> ParseResult<'_, Directive> {
-    map(preceded(tag("tag"), preceded(space1, take_until("\n"))), |name: &str| Directive::Tag {
+fn tag_directive(input: Input<'_>) -> ParseResult<'_, Directive> {
+    map(preceded(tag("tag"), preceded(space1, take_until("\n"))), |name: Input| Directive::Tag {
         name: name.trim().to_string(),
     })(input)
 }
 
 /// Parse option directive
-fn option_directive(input: &str) -> ParseResult<'_, Directive> {
+fn option_directive(input: Input<'_>) -> ParseResult<'_, Directive> {
     map(
-        tuple((tag("option"), space1, take_until(" "), space1, take_until("\n"))),
+        tuple((tag("option"), space1::<Input, _>, take_until(" "), space1, take_until("\n"))),
         |(_, _, name, _, value)| Directive::Option {
             name: name.trim().to_string(),
             value: value.trim().to_string(),
@@ -2121,16 +2309,16 @@ fn option_directive(input: &str) -> ParseResult<'_, Directive> {
 }
 
 /// Parse eval directive
-fn eval_directive(input: &str) -> ParseResult<'_, Directive> {
-    map(preceded(tag("eval"), preceded(space1, take_until("\n"))), |expression: &str| {
+fn eval_directive(input: Input<'_>) -> ParseResult<'_, Directive> {
+    map(preceded(tag("eval"), preceded(space1, take_until("\n"))), |expression: Input| {
         Directive::Eval { expression: expression.trim().to_string() }
     })(input)
 }
 
 /// Parse define directive
-fn define_directive(input: &str) -> ParseResult<'_, Directive> {
+fn define_directive(input: Input<'_>) -> ParseResult<'_, Directive> {
     map(
-        tuple((tag("define"), space1, take_until("="), tag("="), take_until("\n"))),
+        tuple((tag("define"), space1::<Input, _>, take_until("="), tag("="), take_until("\n"))),
         |(_, _, name, _, expression)| Directive::Define {
             name: name.trim().to_string(),
             expression: expression.trim().to_string(),
@@ -2139,19 +2327,19 @@ fn define_directive(input: &str) -> ParseResult<'_, Directive> {
 }
 
 /// Parse year directive
-fn year_directive(input: &str) -> ParseResult<'_, Directive> {
+fn year_directive(input: Input<'_>) -> ParseResult<'_, Directive> {
     // FIXME: invalid year should be an error
     map(
         preceded(
             pair(alt((tag("year"), tag("Y"))), space1),
-            verify(digit1, |s: &str| s.len() == 4),
+            verify(digit1, |s: &Input| s.len() == 4),
         ),
-        |year_str: &str| Directive::Year { year: year_str.parse().unwrap_or(2024) },
+        |year_str: Input| Directive::Year { year: year_str.fragment().parse().unwrap_or(2024) },
     )(input)
 }
 
 /// Parse default commodity directive
-fn default_commodity_directive(input: &str) -> ParseResult<'_, Directive> {
+fn default_commodity_directive(input: Input<'_>) -> ParseResult<'_, Directive> {
     map(
         preceded(
             pair(tag("D"), space1),
@@ -2162,21 +2350,21 @@ fn default_commodity_directive(input: &str) -> ParseResult<'_, Directive> {
 }
 
 /// Parse assert directive
-fn assert_directive(input: &str) -> ParseResult<'_, Directive> {
-    map(preceded(tag("assert"), preceded(space1, take_until("\n"))), |condition: &str| {
+fn assert_directive(input: Input<'_>) -> ParseResult<'_, Directive> {
+    map(preceded(tag("assert"), preceded(space1, take_until("\n"))), |condition: Input| {
         Directive::Assert { condition: condition.trim().to_string() }
     })(input)
 }
 
 /// Parse check directive
-fn check_directive(input: &str) -> ParseResult<'_, Directive> {
-    map(preceded(tag("check"), preceded(space1, take_until("\n"))), |condition: &str| {
+fn check_directive(input: Input<'_>) -> ParseResult<'_, Directive> {
+    map(preceded(tag("check"), preceded(space1, take_until("\n"))), |condition: Input| {
         Directive::Check { condition: condition.trim().to_string() }
     })(input)
 }
 
 /// Parse periodic transaction (starts with ~)
-fn periodic_transaction(input: &str) -> ParseResult<'_, Directive> {
+fn periodic_transaction(input: Input<'_>) -> ParseResult<'_, Directive> {
     map(
         tuple((tag("~"), space0, take_until("\n"), line_ending, many0(posting_line))),
         |(_, _, period, _, postings)| Directive::PeriodicTransaction {
@@ -2188,7 +2376,7 @@ fn periodic_transaction(input: &str) -> ParseResult<'_, Directive> {
 }
 
 /// Parse automated transaction (starts with =)
-fn automated_transaction(input: &str) -> ParseResult<'_, Directive> {
+fn automated_transaction(input: Input<'_>) -> ParseResult<'_, Directive> {
     map(
         tuple((tag("="), space0, take_until("\n"), line_ending, many0(posting_line))),
         |(_, _, condition, _, postings)| Directive::AutomatedTransaction {
@@ -2219,38 +2407,29 @@ mod tests {
     #[test]
     fn test_empty_line() {
         let input = "  \n";
-        let result = empty_line(input);
+        let result = empty_line(input.into());
         assert!(result.is_ok());
-    }
-
-    #[test]
-    fn test_comment_line() {
-        let input = "; This is a comment\n";
-        let result = comment_line(input);
-        assert!(result.is_ok());
-        let (_, comment) = result.unwrap();
-        assert_eq!(comment, " This is a comment");
     }
 
     #[test]
     fn test_account_name() {
-        let (_, name) = account_name("Assets:Checking").unwrap();
+        let (_, name) = account_name(Input::new("Assets:Checking")).unwrap();
         assert_eq!(name, "Assets:Checking");
 
-        let (_, name) = account_name("Assets:Savings Account").unwrap();
+        let (_, name) = account_name(Input::new("Assets:Savings Account")).unwrap();
         assert_eq!(name, "Assets:Savings Account");
 
-        let (_, name) = account_name("Assets:Savings  USD1").unwrap();
+        let (_, name) = account_name(Input::new("Assets:Savings  USD1")).unwrap();
         assert_eq!(name, "Assets:Savings");
 
-        let (_, name) = account_name("Assets:Savings 1  USD1").unwrap();
+        let (_, name) = account_name(Input::new("Assets:Savings 1  USD1")).unwrap();
         assert_eq!(name, "Assets:Savings 1");
     }
 
     #[test]
     fn test_account_directive() {
         let input = "account Assets:Checking\n";
-        let (_, directive) = account_directive(input).unwrap();
+        let (_, directive) = account_directive(input.into()).unwrap();
 
         if let Directive::Account { name, .. } = directive {
             assert_eq!(name, "Assets:Checking");
@@ -2260,43 +2439,97 @@ mod tests {
     }
 
     #[test]
-    fn test_metadata_parsing_colon_style() {
-        let comment = " :Receipt: 12345 :Project: ABC";
-        let metadata = parse_metadata_tags(comment, None);
-        assert_eq!(metadata.get("Receipt"), Some(&"12345".to_string()));
-        assert_eq!(metadata.get("Project"), Some(&"ABC".to_string()));
+    fn test_parse_metadata_tags() {
+        // simple tag
+        let metadata = parse_metadata_tags(":tag:", None);
+        assert_eq!(metadata.get("tag"), Some(&TagData::empty()));
+        assert_eq!(1, metadata.len());
+
+        // chained tags
+        let metadata = parse_metadata_tags(":tag1:tag2:tag3:", None);
+        assert_eq!(metadata.get("tag1"), Some(&TagData::empty()));
+        assert_eq!(metadata.get("tag2"), Some(&TagData::empty()));
+        assert_eq!(metadata.get("tag3"), Some(&TagData::empty()));
+        assert_eq!(3, metadata.len());
+
+        // tags with values
+        let metadata = parse_metadata_tags("tag: foo", None);
+        assert_eq!(metadata.get("tag"), Some(&TagData::new("foo")));
+        assert_eq!(1, metadata.len());
+
+        // typed tags
+        // TODO: these are parsed, but not yet typed
+        let metadata = parse_metadata_tags("tag:: [2025/11/08]", None);
+        assert_eq!(metadata.get("tag"), Some(&TagData::new("[2025/11/08]")));
+        assert_eq!(1, metadata.len());
+
+        //
+        // invalid and special cases
+        //
+
+        // no whitespace around tag
+        let metadata = parse_metadata_tags(":tag :", None);
+        assert_eq!(metadata.get("tag"), None);
+        assert!(metadata.is_empty());
+
+        // no whitespace in tag
+        let metadata = parse_metadata_tags(":with space:", None);
+        assert!(metadata.is_empty());
+
+        // "whitespace in tag" could be a tag w/ value
+        let metadata = parse_metadata_tags(":with space: value", None);
+        assert!(metadata.is_empty());
+
+        // simple tag preceded & followed by words
+        let metadata = parse_metadata_tags("foo :tag: bar", None);
+        assert_eq!(metadata.get("tag"), Some(&TagData::empty()));
+        assert_eq!(1, metadata.len());
+
+        // value tag cannot be preceded by words
+        let metadata = parse_metadata_tags("foo tag: value", None);
+        assert_eq!(metadata.get("tag"), None);
+        assert!(metadata.is_empty());
+
+        // tag followed by words => simple tag, not value
+        let metadata = parse_metadata_tags(":tag: value", None);
+        assert_eq!(metadata.get("tag"), Some(&TagData::empty()));
+        assert_eq!(1, metadata.len());
+
+        // not a chained tag => value tag with colons in tag name
+        let metadata = parse_metadata_tags("foo:bar:qux: value", None);
+        assert_eq!(metadata.get("foo:bar:qux"), Some(&TagData::new("value")));
+        assert_eq!(1, metadata.len());
+
+        // only 1 simple tag per line
+        let metadata = parse_metadata_tags(":tag1: :tag2:", None);
+        assert_eq!(metadata.get("tag1"), Some(&TagData::empty()));
+        assert_eq!(1, metadata.len());
+
+        // only 1 simple tag per line
+        let metadata = parse_metadata_tags(":tag1:\n:tag2:", None);
+        assert_eq!(metadata.get("tag1"), Some(&TagData::empty()));
+        assert_eq!(metadata.get("tag2"), Some(&TagData::empty()));
+        assert_eq!(2, metadata.len());
+
+        // only 1 tag with value per line
+        let metadata = parse_metadata_tags("tag: foo notTag: bar", None);
+        assert_eq!(metadata.get("tag"), Some(&TagData::new("foo notTag: bar")));
+        assert_eq!(1, metadata.len());
     }
 
     #[test]
-    fn test_metadata_parsing_bracket_style() {
-        let comment = " [Receipt: 12345] [Project=ABC]";
-        let metadata = parse_metadata_tags(comment, None);
-        assert_eq!(metadata.get("Receipt"), Some(&"12345".to_string()));
-        assert_eq!(metadata.get("Project"), Some(&"ABC".to_string()));
-    }
-
-    #[test]
-    fn test_metadata_parsing_equals_style() {
-        let comment = " Receipt=12345 Project=ABC";
-        let metadata = parse_metadata_tags(comment, None);
-        assert_eq!(metadata.get("Receipt"), Some(&"12345".to_string()));
-        assert_eq!(metadata.get("Project"), Some(&"ABC".to_string()));
-    }
-
-    #[test]
-    fn test_enhanced_comment_line() {
+    fn test_comment_line() {
         let input = "; This is a comment :Receipt: 12345\n";
-        let result = enhanced_comment_line(input);
+        let result = comment(input.into());
         assert!(result.is_ok());
-        let (_, (comment, metadata)) = result.unwrap();
-        assert_eq!(comment, " This is a comment :Receipt: 12345");
-        assert_eq!(metadata.get("Receipt"), Some(&"12345".to_string()));
+        let (_, comment) = result.unwrap();
+        assert_eq!(comment, "This is a comment :Receipt: 12345");
     }
 
     #[test]
     fn test_include_directive() {
         let input = "include expenses.ledger\n";
-        let result = include_directive(input).unwrap();
+        let result = include_directive(input.into()).unwrap();
 
         if let (_, Directive::Include { path }) = result {
             assert_eq!(path, PathBuf::from("expenses.ledger"));
@@ -2308,7 +2541,7 @@ mod tests {
     #[test]
     fn test_simple_include_directive() {
         let input = "include expenses.dat\n";
-        let result = simple_include_directive(input);
+        let result = simple_include_directive(Input::new(input));
         assert!(result.is_ok());
         if let (_, Directive::Include { path }) = result.unwrap() {
             assert_eq!(path, PathBuf::from("expenses.dat"));
@@ -2320,7 +2553,7 @@ mod tests {
     #[test]
     fn test_conditional_include_directive() {
         let input = "include [exists(\"optional.dat\")] optional.dat\n";
-        let result = conditional_include_directive(input);
+        let result = conditional_include_directive(Input::new(input));
         assert!(result.is_ok());
         if let (_, Directive::ConditionalInclude { condition, path }) = result.unwrap() {
             assert_eq!(condition, "exists(\"optional.dat\")");
@@ -2349,7 +2582,7 @@ mod tests {
     #[test]
     fn test_error_recovery_skip_invalid_line() {
         let input = "invalid line here\n2024/01/01 Valid transaction\n    Assets:Cash   $100\n";
-        let result = skip_invalid_line(input);
+        let result = skip_invalid_line(input.into());
         assert!(result.is_ok());
         let (remaining, _) = result.unwrap();
         assert!(remaining.starts_with("2024/01/01"));
@@ -2364,7 +2597,7 @@ mod tests {
         );
         // Don't add any postings
 
-        let result = parser.validate_transaction(&transaction);
+        let result = parser.validate_transaction(&transaction, "");
         assert!(result.is_err());
 
         if let Err(JournalParseError::ValidationError { message, .. }) = result {
@@ -2380,21 +2613,21 @@ mod tests {
         let input = "line 1\nline 2\nline 3 with error here";
         let error_pos = "line 3 with error here";
 
-        let (line, column) = parser.get_line_column(input, error_pos);
+        let (line, column) = parser.get_line_column(input.into(), error_pos.into());
         assert_eq!(line, 3);
         assert_eq!(column, 1);
     }
 
     #[test]
     fn test_year_directive() {
-        let (_, year) = year_directive("year 1999").unwrap();
+        let (_, year) = year_directive("year 1999".into()).unwrap();
         let Directive::Year { year } = year else {
             panic!("did not parse `year` directive");
         };
 
         assert_eq!(1999, year);
 
-        let (_, year) = year_directive("Y 2020").unwrap();
+        let (_, year) = year_directive("Y 2020".into()).unwrap();
         let Directive::Year { year } = year else {
             panic!("did not parse `Y` directive");
         };
@@ -2404,13 +2637,13 @@ mod tests {
 
     #[test]
     fn test_parse_dates() {
-        let (_, date) = date_field("2023/01/02").unwrap();
+        let (_, date) = date_field("2023/01/02".into()).unwrap();
         assert_eq!(2023, date.year());
         assert_eq!(1, date.month());
         assert_eq!(2, date.day());
-        let (_, date1) = date_field("2023.01.02").unwrap();
+        let (_, date1) = date_field("2023.01.02".into()).unwrap();
         assert_eq!(date, date1);
-        let (_, date2) = date_field("2023-01-02").unwrap();
+        let (_, date2) = date_field("2023-01-02".into()).unwrap();
         assert_eq!(date, date2);
 
         // TODO: invalid
@@ -2418,18 +2651,18 @@ mod tests {
 
         // year optional
         PARSE_STATE.with_borrow_mut(|c| c.current_year = Some(1999));
-        let (_, date) = date_field("02/03").unwrap();
+        let (_, date) = date_field("02/03".into()).unwrap();
         assert_eq!(1999, date.year());
         assert_eq!(2, date.month());
         assert_eq!(3, date.day());
-        let (_, date1) = date_field("02.03").unwrap();
+        let (_, date1) = date_field("02.03".into()).unwrap();
         assert_eq!(date, date1);
-        let (_, date2) = date_field("02-03").unwrap();
+        let (_, date2) = date_field("02-03".into()).unwrap();
         assert_eq!(date, date2);
 
         // 1 digit day & month
         PARSE_STATE.with_borrow_mut(|c| c.current_year = Some(2005));
-        let (_, date) = date_field("4/5").unwrap();
+        let (_, date) = date_field("4/5".into()).unwrap();
         assert_eq!(2005, date.year());
         assert_eq!(4, date.month());
         assert_eq!(5, date.day());
@@ -2441,12 +2674,12 @@ mod tests {
         // assert_eq!(3, date.day());
 
         // 2 digit years are not allowed
-        assert!(date_field("25/04/05").is_err());
+        assert!(date_field("25/04/05".into()).is_err());
     }
 
     #[test]
     fn test_parse_default_commodity() {
-        let (_, commodity) = default_commodity_directive("D 1.00 $").unwrap();
+        let (_, commodity) = default_commodity_directive("D 1.00 $".into()).unwrap();
 
         let Directive::DefaultCommodity { commodity } = commodity else {
             panic!("did not parse `D` (default commodity) directive");
@@ -2461,28 +2694,28 @@ mod tests {
 
     #[test]
     fn test_parse_commodity() {
-        let (_, commodity) = commodity_symbol("USD").unwrap();
+        let (_, commodity) = commodity_symbol("USD".into()).unwrap();
         assert_eq!("USD", commodity);
 
-        let (_, commodity) = commodity_symbol("$1").unwrap();
+        let (_, commodity) = commodity_symbol("$1".into()).unwrap();
         assert_eq!("$", commodity);
 
-        let (_, commodity) = commodity_symbol("€1").unwrap();
+        let (_, commodity) = commodity_symbol("€1".into()).unwrap();
         assert_eq!("€", commodity);
 
-        let (_, commodity) = commodity_symbol("€").unwrap();
+        let (_, commodity) = commodity_symbol("€".into()).unwrap();
         assert_eq!("€", commodity);
 
-        let (_, commodity) = commodity_symbol(r#""M&M""#).unwrap();
+        let (_, commodity) = commodity_symbol(r#""M&M""#.into()).unwrap();
         assert_eq!(r#""M&M""#, commodity);
     }
 
     #[test]
     fn test_parse_quantity() {
         assert_eq!(
-            quantity("1000"),
+            quantity("1000".into()),
             Ok((
-                "",
+                unsafe { Input::new_from_raw_offset(4, 1, "", ()) },
                 ParsedQuantity {
                     format: ParsedQuantityFormat::NoThousandsNorDecimal,
                     decimal: Decimal::new(1000, 0),
@@ -2494,163 +2727,133 @@ mod tests {
         );
 
         assert_eq!(
-            quantity("2.02"),
-            Ok((
-                "",
-                ParsedQuantity {
-                    format: ParsedQuantityFormat::NoThousandsWithDecimal,
-                    decimal: Decimal::new(202, 2),
-                    input: "2.02".to_string(),
-                    decimal_format: DecimalFormat::US,
-                    flags: None
-                }
-            ))
+            quantity("2.02".into()).unwrap().1,
+            ParsedQuantity {
+                format: ParsedQuantityFormat::NoThousandsWithDecimal,
+                decimal: Decimal::new(202, 2),
+                input: "2.02".to_string(),
+                decimal_format: DecimalFormat::US,
+                flags: None
+            }
         );
 
         assert_eq!(
-            quantity("-12.13"),
-            Ok((
-                "",
-                ParsedQuantity {
-                    format: ParsedQuantityFormat::NoThousandsWithDecimal,
-                    decimal: Decimal::new(-1213, 2),
-                    input: "-12.13".to_string(),
-                    decimal_format: DecimalFormat::US,
-                    flags: None
-                }
-            ))
+            quantity("-12.13".into()).unwrap().1,
+            ParsedQuantity {
+                format: ParsedQuantityFormat::NoThousandsWithDecimal,
+                decimal: Decimal::new(-1213, 2),
+                input: "-12.13".to_string(),
+                decimal_format: DecimalFormat::US,
+                flags: None
+            }
         );
 
         assert_eq!(
-            quantity("0.1"),
-            Ok((
-                "",
-                ParsedQuantity {
-                    format: ParsedQuantityFormat::NoThousandsWithDecimal,
-                    decimal: Decimal::new(1, 1),
-                    input: "0.1".to_string(),
-                    decimal_format: DecimalFormat::US,
-                    flags: None
-                }
-            ))
+            quantity("0.1".into()).unwrap().1,
+            ParsedQuantity {
+                format: ParsedQuantityFormat::NoThousandsWithDecimal,
+                decimal: Decimal::new(1, 1),
+                input: "0.1".to_string(),
+                decimal_format: DecimalFormat::US,
+                flags: None
+            }
         );
 
         assert_eq!(
-            quantity("3"),
-            Ok((
-                "",
-                ParsedQuantity {
-                    format: ParsedQuantityFormat::NoThousandsNorDecimal,
-                    decimal: Decimal::new(3, 0),
-                    input: "3".to_string(),
-                    decimal_format: DecimalFormat::US,
-                    flags: None
-                }
-            ))
+            quantity("3".into()).unwrap().1,
+            ParsedQuantity {
+                format: ParsedQuantityFormat::NoThousandsNorDecimal,
+                decimal: Decimal::new(3, 0),
+                input: "3".to_string(),
+                decimal_format: DecimalFormat::US,
+                flags: None
+            }
         );
 
         assert_eq!(
-            quantity("1"),
-            Ok((
-                "",
-                ParsedQuantity {
-                    format: ParsedQuantityFormat::NoThousandsNorDecimal,
-                    decimal: Decimal::new(1, 0),
-                    input: "1".to_string(),
-                    decimal_format: DecimalFormat::US,
-                    flags: None
-                }
-            ))
+            quantity("1".into()).unwrap().1,
+            ParsedQuantity {
+                format: ParsedQuantityFormat::NoThousandsNorDecimal,
+                decimal: Decimal::new(1, 0),
+                input: "1".to_string(),
+                decimal_format: DecimalFormat::US,
+                flags: None
+            }
         );
 
         assert_eq!(
-            quantity("1 ABC"),
-            Ok((
-                " ABC",
-                ParsedQuantity {
-                    format: ParsedQuantityFormat::NoThousandsNorDecimal,
-                    decimal: Decimal::new(1, 0),
-                    input: "1".to_string(),
-                    decimal_format: DecimalFormat::US,
-                    flags: None
-                }
-            ))
+            quantity("1 ABC".into()).unwrap().1,
+            ParsedQuantity {
+                format: ParsedQuantityFormat::NoThousandsNorDecimal,
+                decimal: Decimal::new(1, 0),
+                input: "1".to_string(),
+                decimal_format: DecimalFormat::US,
+                flags: None
+            }
         );
 
         assert_debug_snapshot!(
-            quantity("1,000").unwrap(),
+            quantity("1,000".into()).unwrap().1,
             @r#"
-                (
-                    "",
-                    ParsedQuantity {
-                        format: ThousandsNoDecimal,
-                        decimal: 1000,
-                        input: "1,000",
-                        decimal_format: US,
-                        flags: Some(
-                            CommodityFlags(
-                                STYLE_THOUSANDS,
-                            ),
+                ParsedQuantity {
+                    format: ThousandsNoDecimal,
+                    decimal: 1000,
+                    input: "1,000",
+                    decimal_format: US,
+                    flags: Some(
+                        CommodityFlags(
+                            STYLE_THOUSANDS,
                         ),
-                    },
-                )
+                    ),
+                }
             "#
         );
         assert_debug_snapshot!(
-            quantity("-188,7974").unwrap(),
+            quantity("-188,7974".into()).unwrap().1,
             @r#"
-                (
-                    "",
-                    ParsedQuantity {
-                        format: NoThousandsWithDecimal,
-                        decimal: -188.7974,
-                        input: "-188,7974",
-                        decimal_format: Euro,
-                        flags: Some(
-                            CommodityFlags(
-                                STYLE_DECIMAL_COMMA,
-                            ),
+                ParsedQuantity {
+                    format: NoThousandsWithDecimal,
+                    decimal: -188.7974,
+                    input: "-188,7974",
+                    decimal_format: Euro,
+                    flags: Some(
+                        CommodityFlags(
+                            STYLE_DECIMAL_COMMA,
                         ),
-                    },
-                )
+                    ),
+                }
             "#
         );
         assert_debug_snapshot!(
-            quantity("12,456,132.14").unwrap(),
+            quantity("12,456,132.14".into()).unwrap().1,
             @r#"
-                (
-                    "",
-                    ParsedQuantity {
-                        format: ThousandsAndDecimal,
-                        decimal: 12456132.14,
-                        input: "12,456,132.14",
-                        decimal_format: US,
-                        flags: Some(
-                            CommodityFlags(
-                                STYLE_THOUSANDS,
-                            ),
+                ParsedQuantity {
+                    format: ThousandsAndDecimal,
+                    decimal: 12456132.14,
+                    input: "12,456,132.14",
+                    decimal_format: US,
+                    flags: Some(
+                        CommodityFlags(
+                            STYLE_THOUSANDS,
                         ),
-                    },
-                )
+                    ),
+                }
             "#
         );
         assert_debug_snapshot!(
-            quantity("12.456,14").unwrap(),
+            quantity("12.456,14".into()).unwrap().1,
             @r#"
-                (
-                    "",
-                    ParsedQuantity {
-                        format: ThousandsAndDecimal,
-                        decimal: 12456.14,
-                        input: "12.456,14",
-                        decimal_format: Euro,
-                        flags: Some(
-                            CommodityFlags(
-                                STYLE_DECIMAL_COMMA | STYLE_THOUSANDS,
-                            ),
+                ParsedQuantity {
+                    format: ThousandsAndDecimal,
+                    decimal: 12456.14,
+                    input: "12.456,14",
+                    decimal_format: Euro,
+                    flags: Some(
+                        CommodityFlags(
+                            STYLE_DECIMAL_COMMA | STYLE_THOUSANDS,
                         ),
-                    },
-                )
+                    ),
+                }
             "#
         );
     }
@@ -2660,7 +2863,7 @@ mod tests {
         init();
 
         {
-            let (_, amount) = simple_amount_field("1").unwrap();
+            let (_, amount) = simple_amount_field(Input::new("1")).unwrap();
             insta::assert_debug_snapshot!(amount, @r#"
                 AMOUNT(1) [prec:0, keep:false, raw:1]
             "#);
@@ -2668,7 +2871,7 @@ mod tests {
 
         {
             reset_parse_state();
-            let (_, amount) = simple_amount_field("-1").unwrap();
+            let (_, amount) = simple_amount_field(Input::new("-1")).unwrap();
             insta::assert_debug_snapshot!(amount, @r#"
                 AMOUNT(-1) [prec:0, keep:false, raw:-1]
             "#);
@@ -2676,7 +2879,7 @@ mod tests {
 
         {
             reset_parse_state();
-            let (_, amount) = simple_amount_field("$1").unwrap();
+            let (_, amount) = simple_amount_field(Input::new("$1")).unwrap();
             insta::assert_debug_snapshot!(amount, @r#"
                 AMOUNT($1) [prec:0, keep:false, comm:$, raw:1]
             "#);
@@ -2685,7 +2888,7 @@ mod tests {
 
         {
             reset_parse_state();
-            let (_, amount) = simple_amount_field("1$").unwrap();
+            let (_, amount) = simple_amount_field(Input::new("1$")).unwrap();
             insta::assert_debug_snapshot!(amount, @r#"
                 AMOUNT(1$) [prec:0, keep:false, comm:$, raw:1]
             "#);
@@ -2694,7 +2897,7 @@ mod tests {
 
         {
             reset_parse_state();
-            let (_, amount) = simple_amount_field("-$1").unwrap();
+            let (_, amount) = simple_amount_field(Input::new("-$1")).unwrap();
             insta::assert_debug_snapshot!(amount, @r#"
                 AMOUNT($-1) [prec:0, keep:false, comm:$, raw:-1]
             "#);
@@ -2703,7 +2906,7 @@ mod tests {
 
         {
             reset_parse_state();
-            let (_, amount) = simple_amount_field("$-1").unwrap();
+            let (_, amount) = simple_amount_field(Input::new("$-1")).unwrap();
             insta::assert_debug_snapshot!(amount, @r#"
                 AMOUNT($-1) [prec:0, keep:false, comm:$, raw:-1]
             "#);
@@ -2712,7 +2915,7 @@ mod tests {
 
         {
             reset_parse_state();
-            let (_, amount) = simple_amount_field("$- 1").unwrap();
+            let (_, amount) = simple_amount_field(Input::new("$- 1")).unwrap();
             insta::assert_debug_snapshot!(amount, @r#"
                 AMOUNT($-1) [prec:0, keep:false, comm:$, raw:-1]
             "#);
@@ -2721,7 +2924,7 @@ mod tests {
 
         {
             reset_parse_state();
-            let (_, amount) = simple_amount_field("$ -1").unwrap();
+            let (_, amount) = simple_amount_field(Input::new("$ -1")).unwrap();
             insta::assert_debug_snapshot!(amount, @r#"
                 AMOUNT($ -1) [prec:0, keep:false, comm:$, raw:-1]
             "#);
@@ -2730,7 +2933,7 @@ mod tests {
 
         {
             reset_parse_state();
-            let (_, amount) = simple_amount_field("$ 1").unwrap();
+            let (_, amount) = simple_amount_field(Input::new("$ 1")).unwrap();
             insta::assert_debug_snapshot!(amount, @r#"
                 AMOUNT($ 1) [prec:0, keep:false, comm:$, raw:1]
             "#);
@@ -2739,7 +2942,7 @@ mod tests {
 
         {
             reset_parse_state();
-            let (_, amount) = simple_amount_field("1 USD").unwrap();
+            let (_, amount) = simple_amount_field(Input::new("1 USD")).unwrap();
             insta::assert_debug_snapshot!(amount, @r#"
                 AMOUNT(1 USD) [prec:0, keep:false, comm:USD, raw:1]
             "#);
@@ -2751,7 +2954,7 @@ mod tests {
 
         {
             reset_parse_state();
-            let (_, amount) = simple_amount_field("1USD").unwrap();
+            let (_, amount) = simple_amount_field(Input::new("1USD")).unwrap();
             insta::assert_debug_snapshot!(amount, @r#"
                 AMOUNT(1USD) [prec:0, keep:false, comm:USD, raw:1]
             "#);
@@ -2760,7 +2963,7 @@ mod tests {
 
         {
             reset_parse_state();
-            let (_, amount) = simple_amount_field(r#"1000 "M&M""#).unwrap();
+            let (_, amount) = simple_amount_field(Input::new(r#"1000 "M&M""#)).unwrap();
             insta::assert_debug_snapshot!(amount, @r#"
                 AMOUNT(1000 "M&M") [prec:0, keep:false, comm:"M&M", raw:1000]
             "#);
@@ -2772,7 +2975,7 @@ mod tests {
 
         {
             reset_parse_state();
-            let (_, amount) = simple_amount_field("-1672,42 $").unwrap();
+            let (_, amount) = simple_amount_field(Input::new("-1672,42 $")).unwrap();
             insta::assert_debug_snapshot!(amount, @r#"
                 AMOUNT(-1672.42 $) [prec:2, keep:false, comm:$, raw:-83621/50]
             "#);
@@ -2792,7 +2995,7 @@ mod tests {
             commodity.add_flags(CommodityFlags::STYLE_DECIMAL_COMMA);
             PARSE_STATE.with_borrow_mut(|c| c.commodity_pool.insert(commodity));
 
-            let (_, amount) = simple_amount_field("358,800 €").unwrap();
+            let (_, amount) = simple_amount_field(Input::new("358,800 €")).unwrap();
             insta::assert_debug_snapshot!(amount, @r#"
                 AMOUNT(358.800 €) [prec:3, keep:false, comm:€, raw:1794/5]
             "#);
@@ -2816,8 +3019,9 @@ mod tests {
 
         {
             reset_parse_state();
-            let (rem, amount) = simple_amount_field("-188,7974 STK @ 14,200 $").unwrap();
-            assert_eq!(rem, " @ 14,200 $");
+            let (rem, amount) =
+                simple_amount_field(Input::new("-188,7974 STK @ 14,200 $")).unwrap();
+            assert_eq!(rem.fragment(), &" @ 14,200 $");
             insta::assert_debug_snapshot!(amount, @r#"
                 AMOUNT(-188.7974 STK) [prec:4, keep:false, comm:STK, raw:-943987/5000]
             "#);
@@ -2834,14 +3038,19 @@ mod tests {
     fn test_parse_posting() {
         init();
 
-        let (_, posting) = parse_posting("A  $12").unwrap();
+        let (_, posting) = parse_posting("A  $12".into()).unwrap();
         assert_eq!(posting.account_name(), "A".to_string());
         insta::assert_debug_snapshot!(posting.amount.unwrap(), @r#"
             AMOUNT($12) [prec:0, keep:false, comm:$, raw:12]
         "#);
+        insta::assert_debug_snapshot!(PARSE_STATE.take().accounts.keys(), @r#"
+           [
+               "A",
+           ]
+        "#);
 
         reset_parse_state();
-        let (_, posting) = parse_posting("A\t$12").unwrap();
+        let (_, posting) = parse_posting("A\t$12".into()).unwrap();
         assert_eq!(posting.account_name(), "A".to_string());
         insta::assert_debug_snapshot!(posting.amount.unwrap(), @r#"
             AMOUNT($12) [prec:0, keep:false, comm:$, raw:12]
@@ -2849,19 +3058,19 @@ mod tests {
 
         reset_parse_state();
         // not enough spaces between account and price
-        let (_, posting) = parse_posting("A $12").unwrap();
+        let (_, posting) = parse_posting("A $12".into()).unwrap();
         assert_eq!(posting.account_name(), "A $12".to_string());
         assert!(posting.amount.is_none());
 
         reset_parse_state();
-        let (_, posting) = parse_posting("A  12 USD").unwrap();
+        let (_, posting) = parse_posting("A  12 USD".into()).unwrap();
         assert_eq!(posting.account_name(), "A".to_string());
         insta::assert_debug_snapshot!(posting.amount.unwrap(), @r#"
             AMOUNT(12 USD) [prec:0, keep:false, comm:USD, raw:12]
         "#);
 
         reset_parse_state();
-        let (_, posting) = parse_posting("A  3 @ $4").unwrap();
+        let (_, posting) = parse_posting("A  3 @ $4".into()).unwrap();
         insta::assert_debug_snapshot!(posting.amount.unwrap(), @r#"
             AMOUNT(3) [prec:0, keep:false, raw:3]
         "#);
@@ -2873,7 +3082,7 @@ mod tests {
         assert_eq!(posting.cost, posting.given_cost);
 
         reset_parse_state();
-        let (_, posting) = parse_posting("A  6@@$12").unwrap();
+        let (_, posting) = parse_posting("A  6@@$12".into()).unwrap();
         insta::assert_debug_snapshot!(posting.amount.unwrap(), @r#"
             AMOUNT(6) [prec:0, keep:false, raw:6]
         "#);
@@ -2891,7 +3100,7 @@ mod tests {
         // TODO: virtual cost
 
         reset_parse_state();
-        let (_, posting) = parse_posting("A  3 {$2} @ $4").unwrap();
+        let (_, posting) = parse_posting("A  3 {$2} @ $4".into()).unwrap();
         insta::assert_debug_snapshot!(posting.amount.as_ref().unwrap(), @r#"
             AMOUNT(3) [prec:0, keep:false, comm:, raw:3]
         "#);
@@ -2907,7 +3116,7 @@ mod tests {
         "#);
 
         reset_parse_state();
-        let (_, posting) = parse_posting("A  $1.20 {{£5.00}} @@6.00£").unwrap();
+        let (_, posting) = parse_posting("A  $1.20 {{£5.00}} @@6.00£".into()).unwrap();
         // AMOUNT($1.20) [prec:2, keep:false, comm:$, raw:1.20]
         // amount, as given
         insta::assert_debug_snapshot!(posting.amount.as_ref().unwrap(), @r#"
@@ -2927,7 +3136,7 @@ mod tests {
         "#);
 
         reset_parse_state();
-        let (_, posting) = parse_posting("Actif:SV  -0,0415 MFE @ 358,80 €").unwrap();
+        let (_, posting) = parse_posting("Actif:SV  -0,0415 MFE @ 358,80 €".into()).unwrap();
         insta::assert_debug_snapshot!(posting.amount.as_ref().unwrap(), @r#"
             AMOUNT(-0.0415 MFE) [prec:4, keep:false, comm:MFE, raw:-83/2000]
         "#);
@@ -2948,10 +3157,57 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_posting_tags() {
+        init();
+
+        let (_, posting) = parse_posting("A  1 ; not tag\n".into()).unwrap();
+        insta::assert_debug_snapshot!(posting.note, @r#"
+            Some(
+                "not tag",
+            )
+        "#);
+        insta::assert_debug_snapshot!(posting.metadata, @r#"
+            {}
+        "#);
+
+        let (_, posting) = parse_posting("A  1 ; :tag:\n".into()).unwrap();
+        insta::assert_debug_snapshot!(posting.note, @r#"
+            Some(
+                ":tag:",
+            )
+        "#);
+        insta::assert_debug_snapshot!(posting.metadata, @r#"
+            {
+                "tag": TagData {
+                    value: None,
+                    inherited: false,
+                },
+            }
+        "#);
+
+        let (_, posting) = parse_posting("A  1 ; tag: value\n".into()).unwrap();
+        insta::assert_debug_snapshot!(posting.note, @r#"
+            Some(
+                "tag: value",
+            )
+        "#);
+        insta::assert_debug_snapshot!(posting.metadata, @r#"
+            {
+                "tag": TagData {
+                    value: Some(
+                        "value",
+                    ),
+                    inherited: false,
+                },
+            }
+        "#);
+    }
+
+    #[test]
     fn test_parse_transaction() {
         let input = "2011-03-01 * Z\n    A  10\n    B\n";
         let (_, Transaction { date, status, payee, postings, .. }) =
-            parse_transaction(input).unwrap();
+            parse_transaction(input.into()).unwrap();
 
         assert_eq!(date.format("%Y/%m/%d").to_string(), "2011/03/01");
         assert_eq!(status, TransactionStatus::Cleared);
@@ -2962,7 +3218,8 @@ mod tests {
     #[test]
     fn test_parse_transaction_with_comment() {
         let input = "2011-03-06 ! 2 ; note line 1\n    ; note line 2\n    E  10\n    F\n";
-        let (_, Transaction { date, status, payee, note, .. }) = parse_transaction(input).unwrap();
+        let (_, Transaction { date, status, payee, note, .. }) =
+            parse_transaction(input.into()).unwrap();
 
         assert_eq!(date.format("%Y/%m/%d").to_string(), "2011/03/06");
         assert_eq!(status, TransactionStatus::Pending);
@@ -2973,7 +3230,7 @@ mod tests {
     #[test]
     fn test_parse_transaction_with_comment_overide_payee() {
         let input = "2011-03-06 Foo\n    ; Payee: Bar\n    Act1  1\n    Act2\n";
-        let (_, Transaction { payee, .. }) = parse_transaction(input).unwrap();
+        let (_, Transaction { payee, .. }) = parse_transaction(input.into()).unwrap();
 
         assert_eq!(payee, "Bar".to_string());
     }
@@ -2981,7 +3238,7 @@ mod tests {
     #[test]
     fn test_periodic_transaction_parsing() {
         let input = "~ monthly\n    Assets:Checking   $1000\n    Expenses:Rent\n";
-        let result = periodic_transaction(input);
+        let result = periodic_transaction(input.into());
         assert!(result.is_ok());
 
         if let (_, Directive::PeriodicTransaction { period, postings, .. }) = result.unwrap() {
@@ -2995,7 +3252,7 @@ mod tests {
     #[test]
     fn test_automated_transaction_parsing() {
         let input = "= expr account =~ /Expenses/\n    (Budget:Expenses)   $-1\n";
-        let result = automated_transaction(input);
+        let result = automated_transaction(input.into());
         assert!(result.is_ok());
 
         if let (_, Directive::AutomatedTransaction { condition, postings, .. }) = result.unwrap() {
@@ -3034,5 +3291,176 @@ mod tests {
         }
 
         assert!(journal_iter.next().is_none());
+    }
+
+    #[test]
+    fn test_parse_journal() {
+        let input = textwrap::dedent(
+            "
+            2011-03-06 Foo
+                Act1  1
+                Act2
+            ",
+        );
+
+        let mut parser = JournalParser::new();
+        let journal = parser.parse_journal(&input).unwrap();
+
+        assert_eq!(1, journal.transactions.len());
+        assert_eq!("Foo".to_string(), journal.transactions.get(0).unwrap().payee);
+    }
+
+    #[test]
+    fn test_parser_validation_unknown_account() {
+        let mut parser = JournalParser::with_config(JournalParserConfig {
+            pedantic: true,
+            strict: false,
+            check_payees: false,
+        });
+
+        // make sure the parser knows about Act1
+        parser.parse_journal("account Act1\n").unwrap();
+
+        // transaction with account the parser doesn't know about
+        let input = textwrap::dedent(
+            "
+            2011-03-06 Foo
+                Act1  1
+                Act2
+            ",
+        );
+        let input = input.trim_start();
+
+        let (_, transaction) = parse_transaction(Input::new(input)).unwrap();
+
+        assert_debug_snapshot!(
+            parser.validate_transaction(&transaction, input),
+            @r#"
+                Err(
+                    UnknownAccount {
+                        filename: StdIn,
+                        line: 3,
+                        posting: "    Act2",
+                        account: "Act2",
+                    },
+                )
+            "#
+        );
+    }
+
+    #[test]
+    fn test_parser_validation_unknown_commodity() {
+        let mut parser = JournalParser::with_config(JournalParserConfig {
+            pedantic: true,
+            strict: false,
+            check_payees: false,
+        });
+
+        // make sure the parser knows about Act1 and USD
+        let input = textwrap::dedent(
+            "
+            account Act1
+            commodity USD
+            ",
+        );
+        parser.parse_journal(&input).unwrap();
+
+        // transaction with commodity the parser doesn't know about
+        let input = textwrap::dedent(
+            "
+            2011-03-06 Foo
+                Act1  1USD
+                Act1  1EUR
+                Act1
+            ",
+        );
+        let input = input.trim_start();
+
+        let (_, transaction) = parse_transaction(Input::new(input)).unwrap();
+
+        assert_debug_snapshot!(
+            parser.validate_transaction(&transaction, input),
+            @r#"
+                Err(
+                    UnknownCommodity {
+                        filename: StdIn,
+                        line: 3,
+                        posting: "  Act1  1EUR",
+                        highlight: "        ^^^^",
+                        commodity: "EUR",
+                    },
+                )
+            "#
+        );
+    }
+
+    #[test]
+    fn test_parser_validation_unknown_tag() {
+        let parser = JournalParser::with_config(JournalParserConfig {
+            pedantic: true,
+            strict: false,
+            check_payees: false,
+        });
+
+        // transaction with tag the parser doesn't know about
+        let input = textwrap::dedent(
+            "
+            2011-03-06 Foo
+                ; :foo:
+                Act1  1
+                Act1
+            ",
+        );
+        let input = input.trim_start();
+
+        let (_, transaction) = parse_transaction(Input::new(input)).unwrap();
+
+        assert_debug_snapshot!(
+            parser.validate_transaction(&transaction, input),
+            @r#"
+                Err(
+                    UnknownTag {
+                        filename: StdIn,
+                        line: 1,
+                        tag: "foo",
+                    },
+                )
+            "#
+        );
+    }
+
+    #[test]
+    fn test_parser_validation_unknown_payee() {
+        let parser = JournalParser::with_config(JournalParserConfig {
+            pedantic: true,
+            strict: false,
+            check_payees: true,
+        });
+
+        // transaction with payee the parser doesn't know about
+        let input = textwrap::dedent(
+            "
+            2011-03-06 Foo
+                Act1  1
+                Act1
+            ",
+        );
+        let input = input.trim_start();
+
+        let (_, transaction) = parse_transaction(Input::new(input)).unwrap();
+
+        assert_debug_snapshot!(
+            parser.validate_transaction(&transaction, input),
+            @r#"
+                Err(
+                    UnknownPayee {
+                        filename: StdIn,
+                        line: 1,
+                        description: "2011-03-06 Foo",
+                        payee: "Foo",
+                    },
+                )
+            "#
+        );
     }
 }

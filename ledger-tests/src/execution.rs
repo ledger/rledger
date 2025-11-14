@@ -346,13 +346,29 @@ impl TestExecutor {
             let duration = start_time.elapsed();
 
             // Process output
-            let stdout_lines =
-                String::from_utf8_lossy(&output.stdout).lines().map(|s| s.to_string()).collect();
+            let stdout_lines = String::from_utf8_lossy(&output.stdout)
+                .lines()
+                .map(|s| {
+                    if let Some(ref temp) = temp_file {
+                        let t = &temp.path().canonicalize().unwrap().to_string_lossy().to_string();
+                        s.replace(t, "$FILE").to_string()
+                    } else {
+                        s.to_string()
+                    }
+                })
+                .collect();
 
             let stderr_lines = String::from_utf8_lossy(&output.stderr)
                 .lines()
                 .filter(|line| !line.starts_with("GuardMalloc")) // Filter out malloc debug messages
-                .map(|s| s.to_string())
+                .map(|s| {
+                    if let Some(ref temp) = temp_file {
+                        let t = &temp.path().canonicalize().unwrap().to_string_lossy().to_string();
+                        s.replace(t, "$FILE").to_string()
+                    } else {
+                        s.to_string()
+                    }
+                })
                 .collect();
 
             let exit_code = output.status.code().unwrap_or(-1);

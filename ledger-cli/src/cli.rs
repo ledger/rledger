@@ -96,6 +96,21 @@ pub struct Cli {
     #[arg(long = "exchange", short = 'X', global = true)]
     pub exchange: Option<String>,
 
+    //
+    // Error Checking and Calculation Options
+    //
+    /// Accounts, tags or commodities not previously declared will cause warnings.
+    #[arg(long = "strict", global = true)]
+    pub strict: bool,
+
+    /// Accounts, tags or commodities not previously declared will cause errors.
+    #[arg(long = "pedantic", global = true)]
+    pub pedantic: bool,
+
+    /// Enable strict and pedantic checking for payees as well as accounts, commodities and tags. This only works in conjunction with --strict or --pedantic.
+    #[arg(long = "check-payees", global = true)]
+    pub check_payees: bool,
+
     /// Enable color output
     #[arg(long = "color", global = true)]
     pub color: bool,

@@ -453,25 +453,6 @@ pub fn is_posting_line(input: &str) -> bool {
     input.starts_with(' ') || input.starts_with('\t')
 }
 
-/// Parse metadata tags from comment
-pub fn parse_metadata_tags(comment: &str) -> HashMap<String, String> {
-    let mut metadata = HashMap::new();
-
-    // Simple tag parsing: key:value, key2:value2
-    for part in comment.split(',') {
-        let part = part.trim();
-        if let Some(colon_pos) = part.find(':') {
-            let key = part[..colon_pos].trim().to_string();
-            let value = part[colon_pos + 1..].trim().to_string();
-            metadata.insert(key, value);
-        } else if !part.is_empty() {
-            metadata.insert(part.to_string(), String::new());
-        }
-    }
-
-    metadata
-}
-
 // ============================================================================
 // Tests
 // ============================================================================
@@ -555,13 +536,5 @@ mod tests {
         let (_, amount) = result.unwrap();
         assert_eq!(amount.value, Decimal::new(50000, 2));
         assert_eq!(amount.commodity, Some("$".to_string()));
-    }
-
-    #[test]
-    fn test_metadata_parsing() {
-        let metadata = parse_metadata_tags("category:food, project:kitchen, urgent");
-        assert_eq!(metadata.get("category"), Some(&"food".to_string()));
-        assert_eq!(metadata.get("project"), Some(&"kitchen".to_string()));
-        assert_eq!(metadata.get("urgent"), Some(&String::new()));
     }
 }
