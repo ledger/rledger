@@ -1,14 +1,17 @@
 //! Date and time handling for Ledger
 //!
 //! This module provides date and time functionality compatible with the C++ Ledger
-//! implementation, including timezone support and various date formats.
+//! implementation, including timezone support, various date formats, epoch override
+//! for deterministic testing, and period/interval types.
 
 use chrono::{
     DateTime, Datelike, Days, Months, NaiveDate, NaiveDateTime, TimeDelta, TimeZone, Timelike, Utc,
 };
 use chrono_tz::{America, Tz};
+use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 use std::fmt;
+use std::sync::OnceLock;
 use thiserror::Error;
 
 /// Errors that can occur during date/time operations
@@ -29,6 +32,48 @@ pub type DateTimeResult<T> = Result<T, DateTimeError>;
 /// Default timezone for Ledger (America/Chicago for test compatibility)
 pub static DEFAULT_TIMEZONE: Tz = America::Chicago;
 
+// ---------------------------------------------------------------------------
+// Global epoch override (mirrors C++ `optional<datetime_t> epoch`)
+// ---------------------------------------------------------------------------
+
+/// Global epoch override. When set, `current_date()` and `current_datetime()`
+/// return values derived from the epoch instead of the wall clock. This is used
+/// by the `--now` CLI flag and for deterministic tests.
+static EPOCH: OnceLock<RwLock<Option<NaiveDateTime>>> = OnceLock::new();
+
+/// Set the global epoch to the given datetime.
+pub fn set_epoch(dt: NaiveDateTime) {
+    let lock = EPOCH.get_or_init(|| RwLock::new(None));
+    *lock.write() = Some(dt);
+}
+
+/// Clear the global epoch, reverting to wall-clock time.
+pub fn clear_epoch() {
+    if let Some(lock) = EPOCH.get() {
+        *lock.write() = None;
+    }
+}
+
+/// Return the current date, respecting the global epoch if set.
+pub fn current_date() -> NaiveDate {
+    if let Some(lock) = EPOCH.get() {
+        if let Some(epoch) = *lock.read() {
+            return epoch.date();
+        }
+    }
+    chrono::Local::now().naive_local().date()
+}
+
+/// Return the current datetime, respecting the global epoch if set.
+pub fn current_datetime() -> NaiveDateTime {
+    if let Some(lock) = EPOCH.get() {
+        if let Some(epoch) = *lock.read() {
+            return epoch;
+        }
+    }
+    chrono::Local::now().naive_local()
+}
+
 /// Date type compatible with C++ date_t
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct Date(pub NaiveDate);
@@ -46,10 +91,9 @@ impl Date {
         Date(date)
     }
 
-    /// Get the current date in the default timezone
+    /// Get the current date, respecting the global epoch if set.
     pub fn current() -> Self {
-        let now = Utc::now().with_timezone(&DEFAULT_TIMEZONE);
-        Date(now.date_naive())
+        Date(current_date())
     }
 
     /// Check if this is a valid date (always true for constructed dates)
@@ -165,10 +209,14 @@ impl LocalDateTime {
         LocalDateTime { datetime }
     }
 
-    /// Get the current time in the default timezone
+    /// Get the current time, respecting the global epoch if set.
     pub fn current() -> Self {
-        let now = Utc::now().with_timezone(&DEFAULT_TIMEZONE);
-        LocalDateTime { datetime: now }
+        let naive = current_datetime();
+        let datetime = DEFAULT_TIMEZONE
+            .from_local_datetime(&naive)
+            .single()
+            .unwrap_or_else(|| Utc::now().with_timezone(&DEFAULT_TIMEZONE));
+        LocalDateTime { datetime }
     }
 
     /// Convert to UTC
@@ -332,35 +380,39 @@ pub fn parse_datetime(datetime_str: &str) -> DateTimeResult<LocalDateTime> {
     Err(DateTimeError::InvalidFormat(datetime_str.to_string()))
 }
 
-/// Format a date according to the specified format type
+/// Format a date according to the specified format type.
+///
+/// C++ defaults: Written = `%Y/%m/%d`, Printed = `%y-%b-%d`
 pub fn format_date(date: &Date, format_type: FormatType, custom_format: Option<&str>) -> String {
     match format_type {
-        FormatType::Written => date.naive_date().format("%Y-%m-%d").to_string(),
-        FormatType::Printed => date.naive_date().format("%Y/%m/%d").to_string(),
+        FormatType::Written => date.naive_date().format("%Y/%m/%d").to_string(),
+        FormatType::Printed => date.naive_date().format("%y-%b-%d").to_string(),
         FormatType::Custom => {
             if let Some(fmt) = custom_format {
                 date.naive_date().format(fmt).to_string()
             } else {
-                date.naive_date().format("%Y-%m-%d").to_string()
+                date.naive_date().format("%Y/%m/%d").to_string()
             }
         }
     }
 }
 
-/// Format a datetime according to the specified format type
+/// Format a datetime according to the specified format type.
+///
+/// C++ defaults: Written = `%Y/%m/%d %H:%M:%S`, Printed = `%y-%b-%d %H:%M:%S`
 pub fn format_datetime(
     datetime: &LocalDateTime,
     format_type: FormatType,
     custom_format: Option<&str>,
 ) -> String {
     match format_type {
-        FormatType::Written => datetime.datetime.format("%Y-%m-%d %H:%M:%S %Z").to_string(),
-        FormatType::Printed => datetime.datetime.format("%Y/%m/%d %H:%M:%S").to_string(),
+        FormatType::Written => datetime.datetime.format("%Y/%m/%d %H:%M:%S").to_string(),
+        FormatType::Printed => datetime.datetime.format("%y-%b-%d %H:%M:%S").to_string(),
         FormatType::Custom => {
             if let Some(fmt) = custom_format {
                 datetime.datetime.format(fmt).to_string()
             } else {
-                datetime.datetime.format("%Y-%m-%d %H:%M:%S %Z").to_string()
+                datetime.datetime.format("%Y/%m/%d %H:%M:%S").to_string()
             }
         }
     }
@@ -396,6 +448,481 @@ impl DateDuration {
             DateDuration::Years(n) => Date(date.naive_date() - Months::new(((-n) * 12) as u32)),
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Period types for recurring intervals (merged from ledger-core)
+// ---------------------------------------------------------------------------
+
+/// Period types for recurring intervals
+#[derive(Debug, Clone, PartialEq)]
+pub enum Period {
+    Daily(u32),
+    Weekly(u32),
+    Biweekly,
+    Monthly(u32),
+    Bimonthly,
+    Quarterly(u32),
+    Yearly(u32),
+}
+
+impl Period {
+    /// Get the approximate number of days in the period
+    pub fn approximate_days(&self) -> u32 {
+        match self {
+            Period::Daily(n) => *n,
+            Period::Weekly(n) => n * 7,
+            Period::Biweekly => 14,
+            Period::Monthly(n) => n * 30,
+            Period::Bimonthly => 60,
+            Period::Quarterly(n) => n * 90,
+            Period::Yearly(n) => n * 365,
+        }
+    }
+
+    /// Get the period name as a string
+    pub fn name(&self) -> String {
+        match self {
+            Period::Daily(1) => "daily".to_string(),
+            Period::Daily(n) => format!("every {} days", n),
+            Period::Weekly(1) => "weekly".to_string(),
+            Period::Weekly(n) => format!("every {} weeks", n),
+            Period::Biweekly => "biweekly".to_string(),
+            Period::Monthly(1) => "monthly".to_string(),
+            Period::Monthly(n) => format!("every {} months", n),
+            Period::Bimonthly => "bimonthly".to_string(),
+            Period::Quarterly(1) => "quarterly".to_string(),
+            Period::Quarterly(n) => format!("every {} quarters", n),
+            Period::Yearly(1) => "yearly".to_string(),
+            Period::Yearly(n) => format!("every {} years", n),
+        }
+    }
+
+    /// Add this period to a NaiveDate
+    pub fn add_to_naive_date(&self, date: NaiveDate) -> NaiveDate {
+        match self {
+            Period::Daily(n) => date + chrono::Duration::days(*n as i64),
+            Period::Weekly(n) => date + chrono::Duration::weeks(*n as i64),
+            Period::Biweekly => date + chrono::Duration::weeks(2),
+            Period::Monthly(n) => add_months_to_date(date, *n as i32),
+            Period::Bimonthly => add_months_to_date(date, 2),
+            Period::Quarterly(n) => add_months_to_date(date, (*n * 3) as i32),
+            Period::Yearly(n) => add_years_to_date(date, *n as i32),
+        }
+    }
+
+    /// Subtract this period from a NaiveDate
+    pub fn subtract_from_naive_date(&self, date: NaiveDate) -> NaiveDate {
+        match self {
+            Period::Daily(n) => date - chrono::Duration::days(*n as i64),
+            Period::Weekly(n) => date - chrono::Duration::weeks(*n as i64),
+            Period::Biweekly => date - chrono::Duration::weeks(2),
+            Period::Monthly(n) => add_months_to_date(date, -(*n as i32)),
+            Period::Bimonthly => add_months_to_date(date, -2),
+            Period::Quarterly(n) => add_months_to_date(date, -((*n * 3) as i32)),
+            Period::Yearly(n) => add_years_to_date(date, -(*n as i32)),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// DateInterval with contains/overlaps/iter (merged from ledger-core)
+// ---------------------------------------------------------------------------
+
+/// A date interval with start, end, and period
+#[derive(Debug, Clone)]
+pub struct DateInterval {
+    pub start: Option<NaiveDate>,
+    pub end: Option<NaiveDate>,
+    pub period: Option<Period>,
+    pub end_inclusive: bool,
+}
+
+impl DateInterval {
+    pub fn new(start: Option<NaiveDate>, end: Option<NaiveDate>, period: Option<Period>) -> Self {
+        Self { start, end, period, end_inclusive: false }
+    }
+
+    pub fn from_period(period: Period) -> Self {
+        Self { start: None, end: None, period: Some(period), end_inclusive: false }
+    }
+
+    pub fn from_range(start: NaiveDate, end: NaiveDate, inclusive: bool) -> Self {
+        Self { start: Some(start), end: Some(end), period: None, end_inclusive: inclusive }
+    }
+
+    /// Check if a date falls within this interval
+    pub fn contains(&self, date: NaiveDate) -> bool {
+        let after_start = self.start.is_none_or(|s| date >= s);
+        let before_end = match self.end {
+            Some(end) if self.end_inclusive => date <= end,
+            Some(end) => date < end,
+            None => true,
+        };
+        after_start && before_end
+    }
+
+    /// Check if this interval overlaps with another
+    pub fn overlaps(&self, other: &DateInterval) -> bool {
+        let self_start = self.start.unwrap_or(NaiveDate::MIN);
+        let self_end = self.effective_end();
+        let other_start = other.start.unwrap_or(NaiveDate::MIN);
+        let other_end = other.effective_end();
+        self_start < other_end && other_start < self_end
+    }
+
+    /// Get the duration of this interval in days (if bounded)
+    pub fn duration_days(&self) -> Option<i64> {
+        match (self.start, self.end) {
+            (Some(start), Some(_end)) => Some((self.effective_end() - start).num_days()),
+            _ => None,
+        }
+    }
+
+    /// Get the next date in the period after the given date
+    pub fn next_date_after(&self, date: NaiveDate) -> Option<NaiveDate> {
+        let period = self.period.as_ref()?;
+        let next = period.add_to_naive_date(date);
+        if self.contains(next) { Some(next) } else { None }
+    }
+
+    /// Create an iterator over dates in this interval
+    pub fn iter_dates(&self) -> DateIntervalIterator {
+        DateIntervalIterator { current: self.start, interval: self.clone(), done: false }
+    }
+
+    fn effective_end(&self) -> NaiveDate {
+        let end = self.end.unwrap_or(NaiveDate::MAX);
+        if self.end_inclusive && self.end.is_some() {
+            end + chrono::Duration::days(1)
+        } else {
+            end
+        }
+    }
+}
+
+/// Iterator over dates in a DateInterval
+pub struct DateIntervalIterator {
+    interval: DateInterval,
+    current: Option<NaiveDate>,
+    done: bool,
+}
+
+impl Iterator for DateIntervalIterator {
+    type Item = NaiveDate;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.done {
+            return None;
+        }
+        let current = self.current?;
+        if !self.interval.contains(current) {
+            self.done = true;
+            return None;
+        }
+        let result = current;
+        if let Some(period) = &self.interval.period {
+            self.current = Some(period.add_to_naive_date(current));
+        } else {
+            self.done = true;
+        }
+        Some(result)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// DateDurationCompound (year+month+day compound duration, from ledger-core)
+// ---------------------------------------------------------------------------
+
+/// Compound duration with years, months, and days for relative date calculations
+#[derive(Debug, Clone, PartialEq)]
+pub struct DateDurationCompound {
+    pub years: i32,
+    pub months: i32,
+    pub days: i64,
+}
+
+impl DateDurationCompound {
+    pub fn new(years: i32, months: i32, days: i64) -> Self {
+        Self { years, months, days }
+    }
+
+    pub fn from_days(days: i64) -> Self {
+        Self { years: 0, months: 0, days }
+    }
+
+    pub fn from_months(months: i32) -> Self {
+        Self { years: 0, months, days: 0 }
+    }
+
+    pub fn from_years(years: i32) -> Self {
+        Self { years, months: 0, days: 0 }
+    }
+
+    /// Add this duration to a NaiveDate
+    pub fn add_to_date(&self, date: NaiveDate) -> NaiveDate {
+        let mut result = date;
+        if self.years != 0 {
+            result = add_years_to_date(result, self.years);
+        }
+        if self.months != 0 {
+            result = add_months_to_date(result, self.months);
+        }
+        if self.days != 0 {
+            result += chrono::Duration::days(self.days);
+        }
+        result
+    }
+
+    /// Subtract this duration from a NaiveDate
+    pub fn subtract_from_date(&self, date: NaiveDate) -> NaiveDate {
+        let mut result = date;
+        if self.days != 0 {
+            result -= chrono::Duration::days(self.days);
+        }
+        if self.months != 0 {
+            result = add_months_to_date(result, -self.months);
+        }
+        if self.years != 0 {
+            result = add_years_to_date(result, -self.years);
+        }
+        result
+    }
+
+    pub fn approximate_days(&self) -> i64 {
+        (self.years as i64 * 365) + (self.months as i64 * 30) + self.days
+    }
+
+    pub fn is_zero(&self) -> bool {
+        self.years == 0 && self.months == 0 && self.days == 0
+    }
+}
+
+impl std::ops::Add for DateDurationCompound {
+    type Output = Self;
+    fn add(self, other: Self) -> Self {
+        Self {
+            years: self.years + other.years,
+            months: self.months + other.months,
+            days: self.days + other.days,
+        }
+    }
+}
+
+impl std::ops::Sub for DateDurationCompound {
+    type Output = Self;
+    fn sub(self, other: Self) -> Self {
+        Self {
+            years: self.years - other.years,
+            months: self.months - other.months,
+            days: self.days - other.days,
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Date arithmetic helpers (from ledger-core)
+// ---------------------------------------------------------------------------
+
+fn days_in_month(year: i32, month: u32) -> u32 {
+    match month {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        2 => if is_leap_year(year) { 29 } else { 28 },
+        _ => 30,
+    }
+}
+
+fn is_leap_year(year: i32) -> bool {
+    (year % 4 == 0 && year % 100 != 0) || (year % 400 == 0)
+}
+
+fn add_months_to_date(date: NaiveDate, months: i32) -> NaiveDate {
+    let mut new_year = date.year();
+    let mut new_month = date.month() as i32 + months;
+    while new_month > 12 {
+        new_year += 1;
+        new_month -= 12;
+    }
+    while new_month < 1 {
+        new_year -= 1;
+        new_month += 12;
+    }
+    let new_day = std::cmp::min(date.day(), days_in_month(new_year, new_month as u32));
+    NaiveDate::from_ymd_opt(new_year, new_month as u32, new_day).unwrap_or(date)
+}
+
+fn add_years_to_date(date: NaiveDate, years: i32) -> NaiveDate {
+    let new_year = date.year() + years;
+    let new_day = if date.month() == 2 && date.day() == 29 && !is_leap_year(new_year) {
+        28
+    } else {
+        date.day()
+    };
+    NaiveDate::from_ymd_opt(new_year, date.month(), new_day).unwrap_or(date)
+}
+
+// ---------------------------------------------------------------------------
+// Period parsing (merged from ledger-core)
+// ---------------------------------------------------------------------------
+
+/// Errors that can occur during period parsing
+#[derive(Error, Debug, PartialEq)]
+pub enum PeriodParseError {
+    #[error("Invalid period format: {0}")]
+    InvalidFormat(String),
+    #[error("Unknown period keyword: {0}")]
+    UnknownKeyword(String),
+    #[error("Invalid number in period: {0}")]
+    InvalidNumber(String),
+    #[error("Missing period specification")]
+    MissingPeriod,
+}
+
+/// Parse a period expression string into a DateInterval
+pub fn parse_period(input: &str) -> Result<DateInterval, PeriodParseError> {
+    let input = input.trim().to_lowercase();
+    if input.is_empty() {
+        return Err(PeriodParseError::MissingPeriod);
+    }
+
+    match input.as_str() {
+        "daily" => return Ok(DateInterval::from_period(Period::Daily(1))),
+        "weekly" => return Ok(DateInterval::from_period(Period::Weekly(1))),
+        "biweekly" => return Ok(DateInterval::from_period(Period::Biweekly)),
+        "monthly" => return Ok(DateInterval::from_period(Period::Monthly(1))),
+        "bimonthly" => return Ok(DateInterval::from_period(Period::Bimonthly)),
+        "quarterly" => return Ok(DateInterval::from_period(Period::Quarterly(1))),
+        "yearly" => return Ok(DateInterval::from_period(Period::Yearly(1))),
+        _ => {}
+    }
+
+    if let Some(rest) = input.strip_prefix("every ") {
+        return parse_every_period(rest);
+    }
+
+    if input.starts_with("last ") || input.starts_with("next ") || input.starts_with("this ") {
+        return parse_relative_period_expr(&input);
+    }
+
+    Err(PeriodParseError::InvalidFormat(input))
+}
+
+fn parse_every_period(input: &str) -> Result<DateInterval, PeriodParseError> {
+    let parts: Vec<&str> = input.split_whitespace().collect();
+    if parts.len() == 1 {
+        return match parts[0] {
+            "day" => Ok(DateInterval::from_period(Period::Daily(1))),
+            "week" => Ok(DateInterval::from_period(Period::Weekly(1))),
+            "month" => Ok(DateInterval::from_period(Period::Monthly(1))),
+            "quarter" => Ok(DateInterval::from_period(Period::Quarterly(1))),
+            "year" => Ok(DateInterval::from_period(Period::Yearly(1))),
+            _ => Err(PeriodParseError::UnknownKeyword(parts[0].to_string())),
+        };
+    }
+    if parts.len() == 2 {
+        let n: u32 = parts[0]
+            .parse()
+            .map_err(|_| PeriodParseError::InvalidNumber(parts[0].to_string()))?;
+        return match parts[1] {
+            "day" | "days" => Ok(DateInterval::from_period(Period::Daily(n))),
+            "week" | "weeks" => Ok(DateInterval::from_period(Period::Weekly(n))),
+            "month" | "months" => Ok(DateInterval::from_period(Period::Monthly(n))),
+            "quarter" | "quarters" => Ok(DateInterval::from_period(Period::Quarterly(n))),
+            "year" | "years" => Ok(DateInterval::from_period(Period::Yearly(n))),
+            _ => Err(PeriodParseError::UnknownKeyword(parts[1].to_string())),
+        };
+    }
+    Err(PeriodParseError::InvalidFormat(input.to_string()))
+}
+
+fn parse_relative_period_expr(input: &str) -> Result<DateInterval, PeriodParseError> {
+    let parts: Vec<&str> = input.split_whitespace().collect();
+    if parts.len() != 2 {
+        return Err(PeriodParseError::InvalidFormat(input.to_string()));
+    }
+    let modifier = parts[0];
+    let period_name = parts[1];
+    let today = current_date();
+
+    let (start, end) = match period_name {
+        "day" => {
+            let date = match modifier {
+                "last" => today - chrono::Duration::days(1),
+                "next" => today + chrono::Duration::days(1),
+                "this" => today,
+                _ => return Err(PeriodParseError::UnknownKeyword(modifier.to_string())),
+            };
+            (date, date + chrono::Duration::days(1))
+        }
+        "week" => {
+            let start_of_week = {
+                let days_since_sunday = today.weekday().num_days_from_sunday();
+                today - chrono::Duration::days(days_since_sunday as i64)
+            };
+            match modifier {
+                "last" => {
+                    let s = start_of_week - chrono::Duration::days(7);
+                    (s, s + chrono::Duration::days(7))
+                }
+                "next" => {
+                    let s = start_of_week + chrono::Duration::days(7);
+                    (s, s + chrono::Duration::days(7))
+                }
+                "this" => (start_of_week, start_of_week + chrono::Duration::days(7)),
+                _ => return Err(PeriodParseError::UnknownKeyword(modifier.to_string())),
+            }
+        }
+        "month" => {
+            let som = NaiveDate::from_ymd_opt(today.year(), today.month(), 1)
+                .ok_or_else(|| PeriodParseError::InvalidFormat("Invalid month".into()))?;
+            match modifier {
+                "last" => {
+                    let prev = add_months_to_date(som, -1);
+                    let prev_som = NaiveDate::from_ymd_opt(prev.year(), prev.month(), 1)
+                        .unwrap_or(prev);
+                    (prev_som, som)
+                }
+                "next" => {
+                    let next_som = add_months_to_date(som, 1);
+                    let after = add_months_to_date(som, 2);
+                    (next_som, after)
+                }
+                "this" => {
+                    let next_som = add_months_to_date(som, 1);
+                    (som, next_som)
+                }
+                _ => return Err(PeriodParseError::UnknownKeyword(modifier.to_string())),
+            }
+        }
+        "year" => {
+            let soy = NaiveDate::from_ymd_opt(today.year(), 1, 1)
+                .ok_or_else(|| PeriodParseError::InvalidFormat("Invalid year".into()))?;
+            match modifier {
+                "last" => {
+                    let prev = NaiveDate::from_ymd_opt(today.year() - 1, 1, 1)
+                        .ok_or_else(|| PeriodParseError::InvalidFormat("Invalid year".into()))?;
+                    (prev, soy)
+                }
+                "next" => {
+                    let next = NaiveDate::from_ymd_opt(today.year() + 1, 1, 1)
+                        .ok_or_else(|| PeriodParseError::InvalidFormat("Invalid year".into()))?;
+                    let after = NaiveDate::from_ymd_opt(today.year() + 2, 1, 1)
+                        .ok_or_else(|| PeriodParseError::InvalidFormat("Invalid year".into()))?;
+                    (next, after)
+                }
+                "this" => {
+                    let next = NaiveDate::from_ymd_opt(today.year() + 1, 1, 1)
+                        .ok_or_else(|| PeriodParseError::InvalidFormat("Invalid year".into()))?;
+                    (soy, next)
+                }
+                _ => return Err(PeriodParseError::UnknownKeyword(modifier.to_string())),
+            }
+        }
+        _ => return Err(PeriodParseError::UnknownKeyword(period_name.to_string())),
+    };
+
+    Ok(DateInterval::from_range(start, end, false))
 }
 
 /// Timezone utilities
@@ -462,8 +989,9 @@ mod tests {
     #[test]
     fn test_format_date() {
         let date = Date::new(2023, 12, 25).unwrap();
-        assert_eq!(format_date(&date, FormatType::Written, None), "2023-12-25");
-        assert_eq!(format_date(&date, FormatType::Printed, None), "2023/12/25");
+        // C++ Written = %Y/%m/%d, Printed = %y-%b-%d
+        assert_eq!(format_date(&date, FormatType::Written, None), "2023/12/25");
+        assert_eq!(format_date(&date, FormatType::Printed, None), "23-Dec-25");
     }
 
     #[test]
@@ -478,5 +1006,71 @@ mod tests {
         assert!(timezone::parse_timezone("EST").is_ok());
         assert!(timezone::parse_timezone("UTC").is_ok());
         assert!(timezone::parse_timezone("Invalid/Timezone").is_err());
+    }
+
+    #[test]
+    fn test_epoch_set_and_clear() {
+        let epoch_dt = NaiveDate::from_ymd_opt(2020, 6, 15)
+            .unwrap()
+            .and_hms_opt(12, 0, 0)
+            .unwrap();
+
+        set_epoch(epoch_dt);
+        assert_eq!(current_date(), NaiveDate::from_ymd_opt(2020, 6, 15).unwrap());
+        assert_eq!(current_datetime(), epoch_dt);
+
+        // Date::current() should also respect epoch
+        let d = Date::current();
+        assert_eq!(d.year(), 2020);
+        assert_eq!(d.month(), 6);
+        assert_eq!(d.day(), 15);
+
+        clear_epoch();
+        // After clearing, current_date should return today (not 2020)
+        let now = current_date();
+        assert_ne!(now, NaiveDate::from_ymd_opt(2020, 6, 15).unwrap());
+    }
+
+    #[test]
+    fn test_period_basic() {
+        assert_eq!(Period::Daily(1).name(), "daily");
+        assert_eq!(Period::Weekly(2).name(), "every 2 weeks");
+        assert_eq!(Period::Quarterly(1).name(), "quarterly");
+    }
+
+    #[test]
+    fn test_period_parsing() {
+        let daily = parse_period("daily").unwrap();
+        assert_eq!(daily.period, Some(Period::Daily(1)));
+
+        let every_3_days = parse_period("every 3 days").unwrap();
+        assert_eq!(every_3_days.period, Some(Period::Daily(3)));
+    }
+
+    #[test]
+    fn test_date_interval_contains() {
+        let start = NaiveDate::from_ymd_opt(2023, 1, 1).unwrap();
+        let end = NaiveDate::from_ymd_opt(2023, 12, 31).unwrap();
+        let interval = DateInterval::from_range(start, end, false);
+
+        assert!(interval.contains(NaiveDate::from_ymd_opt(2023, 6, 15).unwrap()));
+        assert!(interval.contains(start));
+        assert!(!interval.contains(end)); // exclusive
+    }
+
+    #[test]
+    fn test_date_interval_iterator() {
+        let start = NaiveDate::from_ymd_opt(2023, 1, 1).unwrap();
+        let end = NaiveDate::from_ymd_opt(2023, 1, 8).unwrap();
+        let interval = DateInterval {
+            start: Some(start),
+            end: Some(end),
+            period: Some(Period::Daily(2)),
+            end_inclusive: false,
+        };
+        let dates: Vec<_> = interval.iter_dates().collect();
+        assert_eq!(dates.len(), 4); // 1, 3, 5, 7
+        assert_eq!(dates[0], NaiveDate::from_ymd_opt(2023, 1, 1).unwrap());
+        assert_eq!(dates[3], NaiveDate::from_ymd_opt(2023, 1, 7).unwrap());
     }
 }

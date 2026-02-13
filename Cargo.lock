@@ -1197,6 +1197,7 @@ dependencies = [
  "num-bigint",
  "num-rational",
  "num-traits",
+ "parking_lot",
  "proptest",
  "quickcheck",
  "rust_decimal",

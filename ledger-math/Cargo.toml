@@ -17,6 +17,7 @@ thiserror = { workspace = true }
 serde = { workspace = true }
 chrono = { workspace = true }
 chrono-tz = { workspace = true }
+parking_lot = { workspace = true }
 bitflags = { workspace = true }
 unicode-width = { workspace = true }
 

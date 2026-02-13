@@ -32,6 +32,9 @@ pub mod posting;
 /// Module for data filtering operations
 pub mod filters;
 
+/// Module for posting processing pipeline (Chain of Responsibility)
+pub mod handler;
+
 /// Module for output formatting
 pub mod output;
 
@@ -41,14 +44,11 @@ pub mod report;
 /// Module for expression evaluation
 pub mod expr;
 
-/// Module for date/time parsing and handling
-pub mod datetime;
+/// Re-export date/time types from ledger-math (canonical module)
+pub use ledger_math::datetime;
 
 /// Module for journal file parsing using nom combinators
 pub mod parser;
-
-/// Module for transaction parsing using nom combinators
-pub mod transaction_parser;
 
 /// Module for C Foreign Function Interface
 // FIXME: temporarily allow dead code in ffi
@@ -60,9 +60,6 @@ pub mod cache;
 
 /// Module for optimized string handling
 pub mod strings;
-
-/// Module for zero-copy parsing optimizations
-pub mod parser_zero_copy;
 
 /// Module for parallel processing optimizations
 pub mod parallel;

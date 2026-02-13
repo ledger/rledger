@@ -227,8 +227,9 @@ mod formatting_tests {
     fn test_date_formatting() {
         let date = Date::new(2023, 12, 25).unwrap();
 
-        assert_eq!(format_date(&date, FormatType::Written, None), "2023-12-25");
-        assert_eq!(format_date(&date, FormatType::Printed, None), "2023/12/25");
+        // C++ Written = %Y/%m/%d, Printed = %y-%b-%d
+        assert_eq!(format_date(&date, FormatType::Written, None), "2023/12/25");
+        assert_eq!(format_date(&date, FormatType::Printed, None), "23-Dec-25");
         assert_eq!(format_date(&date, FormatType::Custom, Some("%d/%m/%Y")), "25/12/2023");
     }
 
@@ -236,12 +237,13 @@ mod formatting_tests {
     fn test_datetime_formatting() {
         let dt = LocalDateTime::new(2023, 12, 25, 14, 30, 0).unwrap();
 
+        // C++ Written = %Y/%m/%d %H:%M:%S, Printed = %y-%b-%d %H:%M:%S
         let written = format_datetime(&dt, FormatType::Written, None);
-        assert!(written.contains("2023-12-25"));
+        assert!(written.contains("2023/12/25"));
         assert!(written.contains("14:30:00"));
 
         let printed = format_datetime(&dt, FormatType::Printed, None);
-        assert!(printed.contains("2023/12/25"));
+        assert!(printed.contains("23-Dec-25"));
         assert!(printed.contains("14:30:00"));
     }
 }

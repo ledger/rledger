@@ -22,8 +22,10 @@ pub use commodity::{
     CommodityPool, CommodityRef, Date as CommodityDate, Expression, KeepDetails,
 };
 pub use datetime::{
-    format_date, format_datetime, parse_date, parse_datetime, timezone, Date, DateDuration,
-    DateTimeError, DateTimeResult, FormatType, LocalDateTime, DEFAULT_TIMEZONE,
+    clear_epoch, current_date, current_datetime, format_date, format_datetime, parse_date,
+    parse_datetime, parse_period, set_epoch, timezone, Date, DateDuration, DateDurationCompound,
+    DateInterval, DateIntervalIterator, DateTimeError, DateTimeResult, FormatType, LocalDateTime,
+    Period, PeriodParseError, DEFAULT_TIMEZONE,
 };
 pub use formatting::{
     apply_width_formatting, format_amount, format_balance, format_rational, FormatConfig,
