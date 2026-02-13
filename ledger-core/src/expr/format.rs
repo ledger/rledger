@@ -4,6 +4,8 @@
 //! for customizing report output with % directives similar to printf-style formatting.
 
 use crate::balance::Balance;
+use crate::expr::scope::Scope;
+use crate::expr::{Expression, Value};
 use crate::posting::Posting;
 use crate::transaction::Transaction;
 use std::collections::HashMap;
@@ -417,6 +419,320 @@ impl FormatProcessor {
             ("n", "Note"),
         ]
     }
+
+    /// Parse a format string into a sequence of elements.
+    ///
+    /// Supports three kinds of elements:
+    /// - `%(expr)` or `%(width expr)` — expression elements
+    /// - `%X` legacy field directives (single or multi-char like `%payee`)
+    /// - literal text
+    /// - `%%` → literal `%`
+    pub fn parse_format_string(format_str: &str) -> FormatResult<Vec<FormatElement>> {
+        let mut elements = Vec::new();
+        let mut literal = String::new();
+        let mut chars = format_str.chars().peekable();
+
+        while let Some(ch) = chars.next() {
+            if ch == '%' {
+                match chars.peek() {
+                    Some(&'%') => {
+                        // Escaped percent
+                        literal.push('%');
+                        chars.next();
+                    }
+                    Some(&'(') => {
+                        // Flush any accumulated literal
+                        if !literal.is_empty() {
+                            elements.push(FormatElement::Literal(std::mem::take(&mut literal)));
+                        }
+                        chars.next(); // consume '('
+
+                        // Parse optional width prefix: [-]digits before the expression
+                        let width = Self::parse_expr_width(&mut chars)?;
+
+                        // Read until matching ')' respecting nesting
+                        let expr_str = Self::read_balanced_parens(&mut chars)?;
+
+                        let expr = Expression::parse(&expr_str).map_err(|e| {
+                            FormatError::ExpressionError(format!(
+                                "Failed to parse expression '{}': {}",
+                                expr_str, e
+                            ))
+                        })?;
+
+                        elements.push(FormatElement::Expression(expr, width));
+                    }
+                    _ => {
+                        // Legacy field directive — flush literal, then collect spec
+                        if !literal.is_empty() {
+                            elements.push(FormatElement::Literal(std::mem::take(&mut literal)));
+                        }
+
+                        let mut spec_str = String::from('%');
+                        while let Some(&next_ch) = chars.peek() {
+                            spec_str.push(next_ch);
+                            chars.next();
+                            if next_ch.is_ascii_alphabetic() || next_ch == '_' {
+                                while let Some(&name_ch) = chars.peek() {
+                                    if name_ch.is_ascii_alphanumeric() || name_ch == '_' {
+                                        spec_str.push(name_ch);
+                                        chars.next();
+                                    } else {
+                                        break;
+                                    }
+                                }
+                                break;
+                            }
+                        }
+                        let spec = FormatSpec::parse(&spec_str)?;
+                        elements.push(FormatElement::LegacyField(spec));
+                    }
+                }
+            } else {
+                literal.push(ch);
+            }
+        }
+
+        if !literal.is_empty() {
+            elements.push(FormatElement::Literal(literal));
+        }
+
+        Ok(elements)
+    }
+
+    /// Parse an optional width prefix inside `%(...)`.
+    ///
+    /// Accepts an optional `-` for left-alignment followed by digits.
+    /// Returns `None` if no width prefix is present.
+    fn parse_expr_width(
+        chars: &mut std::iter::Peekable<std::str::Chars<'_>>,
+    ) -> FormatResult<Option<FormatWidth>> {
+        let mut right_align = true;
+        let mut digits = String::new();
+
+        // Check for leading '-'
+        if chars.peek() == Some(&'-') {
+            // Peek further to see if a digit follows — otherwise it's part of the expression
+            chars.next(); // consume '-'
+            if chars.peek().is_some_and(|c| c.is_ascii_digit()) {
+                right_align = false;
+            } else {
+                // Not a width — put the '-' back by returning None and letting
+                // the caller re-process. We can't truly "unread" chars, so we
+                // instead stuff the '-' back into the stream via a helper.
+                // Since Peekable doesn't support pushback, we handle this by
+                // noting we already consumed '-'. The expression parser will
+                // need it, so we return a special error-free None and the
+                // caller will prepend '-' to the expression string.
+                return Ok(Some(FormatWidth { min_width: 0, right_align: true, prefix_consumed: Some('-') }));
+            }
+        }
+
+        // Collect digits
+        while chars.peek().is_some_and(|c| c.is_ascii_digit()) {
+            digits.push(chars.next().unwrap());
+        }
+
+        if digits.is_empty() {
+            return Ok(None);
+        }
+
+        let min_width = digits.parse::<usize>().map_err(|_| {
+            FormatError::InvalidSpecification(format!("Invalid width in expression format: {}", digits))
+        })?;
+
+        Ok(Some(FormatWidth { min_width, right_align, prefix_consumed: None }))
+    }
+
+    /// Read characters until the matching `)` is found, respecting nested parentheses.
+    fn read_balanced_parens(
+        chars: &mut std::iter::Peekable<std::str::Chars<'_>>,
+    ) -> FormatResult<String> {
+        let mut result = String::new();
+        let mut depth: u32 = 1;
+
+        for ch in chars.by_ref() {
+            match ch {
+                '(' => {
+                    depth += 1;
+                    result.push(ch);
+                }
+                ')' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return Ok(result);
+                    }
+                    result.push(ch);
+                }
+                _ => result.push(ch),
+            }
+        }
+
+        Err(FormatError::InvalidDirective(
+            "Unmatched '(' in format expression".to_string(),
+        ))
+    }
+
+    /// Format a string using a scope for expression evaluation.
+    ///
+    /// This is the preferred method for new code. It supports both `%(expr)` expression
+    /// elements and legacy `%X` field codes (which are resolved via the scope).
+    pub fn format_with_scope(format_str: &str, scope: &dyn Scope) -> FormatResult<String> {
+        let elements = Self::parse_format_string(format_str)?;
+        let mut result = String::new();
+
+        for element in &elements {
+            match element {
+                FormatElement::Literal(text) => result.push_str(text),
+                FormatElement::Expression(expr, width) => {
+                    // If width parsing consumed a character that wasn't actually a width
+                    // prefix, prepend it to the expression source for re-parse.
+                    let value = if let Some(fw) = width {
+                        if let Some(prefix_ch) = fw.prefix_consumed {
+                            // The prefix char was consumed but isn't a real width.
+                            // Re-parse the expression with the prefix prepended.
+                            let patched_src = format!(
+                                "{}{}",
+                                prefix_ch,
+                                expr.source.as_deref().unwrap_or("")
+                            );
+                            let patched_expr =
+                                Expression::parse(&patched_src).map_err(|e| {
+                                    FormatError::ExpressionError(e.to_string())
+                                })?;
+                            patched_expr.evaluate_in_scope(scope).map_err(|e| {
+                                FormatError::ExpressionError(e.to_string())
+                            })?
+                        } else {
+                            expr.evaluate_in_scope(scope).map_err(|e| {
+                                FormatError::ExpressionError(e.to_string())
+                            })?
+                        }
+                    } else {
+                        expr.evaluate_in_scope(scope).map_err(|e| {
+                            FormatError::ExpressionError(e.to_string())
+                        })?
+                    };
+
+                    let text = value.to_display_string();
+
+                    match width {
+                        Some(fw) if fw.prefix_consumed.is_none() && fw.min_width > 0 => {
+                            result.push_str(&apply_width(&text, fw));
+                        }
+                        _ => result.push_str(&text),
+                    }
+                }
+                FormatElement::LegacyField(spec) => {
+                    let value = resolve_legacy_field(spec, scope)?;
+                    let formatted = Self::apply_formatting(&value, spec)?;
+                    result.push_str(&formatted);
+                }
+            }
+        }
+
+        Ok(result)
+    }
+}
+
+/// A format element — either literal text, a legacy `%X` code, or an expression.
+#[derive(Debug, Clone)]
+pub enum FormatElement {
+    /// Literal text to include verbatim.
+    Literal(String),
+    /// Legacy printf-style field directive (e.g. `%d`, `%-20p`).
+    LegacyField(FormatSpec),
+    /// Expression with optional width (e.g. `%(account)`, `%(20account)`).
+    Expression(Expression, Option<FormatWidth>),
+}
+
+/// Width/alignment for an expression format element.
+#[derive(Debug, Clone)]
+pub struct FormatWidth {
+    /// Minimum field width.
+    pub min_width: usize,
+    /// If true, right-align (pad on left); if false, left-align (pad on right).
+    pub right_align: bool,
+    /// If set, this character was consumed during width parsing but is not
+    /// actually a width prefix — it belongs to the expression.
+    pub prefix_consumed: Option<char>,
+}
+
+/// Apply width formatting to a string.
+fn apply_width(text: &str, width: &FormatWidth) -> String {
+    if text.len() >= width.min_width {
+        return text.to_string();
+    }
+    let padding = width.min_width - text.len();
+    if width.right_align {
+        format!("{}{}", " ".repeat(padding), text)
+    } else {
+        format!("{}{}", text, " ".repeat(padding))
+    }
+}
+
+/// Resolve a legacy format field code via a scope.
+///
+/// Maps single-character codes to scope variable names and evaluates them.
+fn resolve_legacy_field(spec: &FormatSpec, scope: &dyn Scope) -> FormatResult<String> {
+    let scope_name = match spec.field.as_str() {
+        "d" => "date",
+        "D" => "date",       // alternate date format
+        "p" | "payee" => "payee",
+        "a" | "account" => "account",
+        "A" => "account",    // leaf name handled below
+        "t" | "amount" => "amount",
+        "T" | "total" => "display_total",
+        "c" | "code" => "code",
+        "n" | "note" => "note",
+        "y" | "Y" | "m" => "date", // date sub-fields
+        other => other,
+    };
+
+    let value = crate::expr::scope::resolve(scope, scope_name);
+
+    match value {
+        Some(val) => {
+            let mut text = val.to_display_string();
+
+            // Apply special formatting for certain legacy codes
+            match spec.field.as_str() {
+                "d" => {
+                    if let Value::Date(d) = val {
+                        text = d.format("%Y-%m-%d").to_string();
+                    }
+                }
+                "D" => {
+                    if let Value::Date(d) = val {
+                        text = d.format("%Y/%m/%d").to_string();
+                    }
+                }
+                "y" => {
+                    if let Value::Date(d) = val {
+                        text = d.format("%y").to_string();
+                    }
+                }
+                "Y" => {
+                    if let Value::Date(d) = val {
+                        text = d.format("%Y").to_string();
+                    }
+                }
+                "m" => {
+                    if let Value::Date(d) = val {
+                        text = d.format("%m").to_string();
+                    }
+                }
+                "A" => {
+                    // Account leaf name
+                    text = text.split(':').next_back().unwrap_or(&text).to_string();
+                }
+                _ => {}
+            }
+
+            Ok(text)
+        }
+        None => Ok(String::new()),
+    }
 }
 
 #[cfg(test)]
@@ -526,5 +842,172 @@ mod tests {
         assert!(fields.iter().any(|(field, _)| *field == "d"));
         assert!(fields.iter().any(|(field, _)| *field == "p"));
         assert!(fields.iter().any(|(field, _)| *field == "a"));
+    }
+
+    // -----------------------------------------------------------------------
+    // Expression-based format tests (format_with_scope)
+    // -----------------------------------------------------------------------
+
+    use crate::expr::scope::BindScope;
+    use crate::expr::scope_impl::{PostingScope, TransactionScope};
+    use crate::expr::Value;
+
+    /// Helper: build a scope with common test data (transaction + posting).
+    fn make_scope_test_data() -> (Transaction, crate::account::AccountTree) {
+        use crate::transaction::TransactionBuilder;
+        use ledger_math::{commodity::Commodity, Decimal};
+        use std::sync::Arc;
+
+        let mut tree = crate::account::AccountTree::new();
+        let checking = tree.find_account("Assets:Checking", true).unwrap();
+        let groceries = tree.find_account("Expenses:Groceries", true).unwrap();
+        let date = NaiveDate::from_ymd_opt(2024, 3, 15).unwrap();
+        let usd = Some(Arc::new(Commodity::new("USD")));
+
+        let txn = TransactionBuilder::new(date, "Whole Foods".to_string())
+            .code("CHK100")
+            .note("Weekly groceries")
+            .post_to(
+                checking,
+                Amount::with_commodity(Decimal::new(-4250, 2), usd.clone()),
+            )
+            .post_to(
+                groceries,
+                Amount::with_commodity(Decimal::new(4250, 2), usd),
+            )
+            .build()
+            .unwrap();
+
+        (txn, tree)
+    }
+
+    #[test]
+    fn test_expr_format_simple_expression() {
+        let (txn, _tree) = make_scope_test_data();
+        let txn_scope = TransactionScope::new(&txn, None);
+        let posting = &txn.postings[1]; // Expenses:Groceries
+        let post_scope = PostingScope::new(posting, Some(&txn), Some(&txn_scope));
+
+        let result = FormatProcessor::format_with_scope("%(account)", &post_scope).unwrap();
+        assert!(result.contains("Groceries"), "got: {}", result);
+    }
+
+    #[test]
+    fn test_expr_format_with_function() {
+        let (txn, _tree) = make_scope_test_data();
+        let txn_scope = TransactionScope::new(&txn, None);
+        let posting = &txn.postings[1]; // +42.50 USD
+        let post_scope = PostingScope::new(posting, Some(&txn), Some(&txn_scope));
+
+        let result =
+            FormatProcessor::format_with_scope("%(quantity(amount))", &post_scope).unwrap();
+        assert!(result.contains("42.50"), "got: {}", result);
+    }
+
+    #[test]
+    fn test_expr_format_width_right_align() {
+        let mut scope = BindScope::empty();
+        scope.define("account", Value::String("Test".into()));
+
+        let result = FormatProcessor::format_with_scope("%(20account)", &scope).unwrap();
+        assert_eq!(result, "                Test");
+        assert_eq!(result.len(), 20);
+    }
+
+    #[test]
+    fn test_expr_format_width_left_align() {
+        let mut scope = BindScope::empty();
+        scope.define("account", Value::String("Test".into()));
+
+        let result = FormatProcessor::format_with_scope("%(-20account)", &scope).unwrap();
+        assert_eq!(result, "Test                ");
+        assert_eq!(result.len(), 20);
+    }
+
+    #[test]
+    fn test_expr_format_mixed_fields() {
+        let (txn, _tree) = make_scope_test_data();
+        let txn_scope = TransactionScope::new(&txn, None);
+        let posting = &txn.postings[1];
+        let post_scope = PostingScope::new(posting, Some(&txn), Some(&txn_scope));
+
+        let result =
+            FormatProcessor::format_with_scope("%(date) %(payee)", &post_scope).unwrap();
+        assert!(result.contains("2024/03/15"), "got: {}", result);
+        assert!(result.contains("Whole Foods"), "got: {}", result);
+    }
+
+    #[test]
+    fn test_expr_format_legacy_compat() {
+        let (txn, _tree) = make_scope_test_data();
+        let txn_scope = TransactionScope::new(&txn, None);
+        let posting = &txn.postings[1];
+        let post_scope = PostingScope::new(posting, Some(&txn), Some(&txn_scope));
+
+        // Legacy %d %p should still work with scope-based formatting
+        let result = FormatProcessor::format_with_scope("%d %p", &post_scope).unwrap();
+        assert!(result.contains("2024-03-15"), "got: {}", result);
+        assert!(result.contains("Whole Foods"), "got: {}", result);
+    }
+
+    #[test]
+    fn test_expr_format_combined_legacy_and_expr() {
+        let (txn, _tree) = make_scope_test_data();
+        let txn_scope = TransactionScope::new(&txn, None);
+        let posting = &txn.postings[1];
+        let post_scope = PostingScope::new(posting, Some(&txn), Some(&txn_scope));
+
+        let result =
+            FormatProcessor::format_with_scope("%d %(payee) %(account)", &post_scope).unwrap();
+        assert!(result.contains("2024-03-15"), "got: {}", result);
+        assert!(result.contains("Whole Foods"), "got: {}", result);
+        assert!(result.contains("Groceries"), "got: {}", result);
+    }
+
+    #[test]
+    fn test_expr_format_escaped_percent() {
+        let scope = BindScope::empty();
+        let result = FormatProcessor::format_with_scope("100%% done", &scope).unwrap();
+        assert_eq!(result, "100% done");
+    }
+
+    #[test]
+    fn test_expr_format_nested_parens() {
+        let (txn, _tree) = make_scope_test_data();
+        let txn_scope = TransactionScope::new(&txn, None);
+        let posting = &txn.postings[1];
+        let post_scope = PostingScope::new(posting, Some(&txn), Some(&txn_scope));
+
+        // justify(scrub(display_amount), 20) — nested function calls
+        let result = FormatProcessor::format_with_scope(
+            "%(justify(scrub(display_amount(amount)), 20))",
+            &post_scope,
+        );
+        // Even if the functions produce placeholder results, parsing should succeed
+        assert!(result.is_ok(), "parse failed: {:?}", result.err());
+    }
+
+    #[test]
+    fn test_parse_format_string_elements() {
+        let elements = FormatProcessor::parse_format_string("Hello %(account) world %d!").unwrap();
+        assert_eq!(elements.len(), 5);
+        assert!(matches!(&elements[0], FormatElement::Literal(s) if s == "Hello "));
+        assert!(matches!(&elements[1], FormatElement::Expression(..)));
+        assert!(matches!(&elements[2], FormatElement::Literal(s) if s == " world "));
+        assert!(matches!(&elements[3], FormatElement::LegacyField(..)));
+        assert!(matches!(&elements[4], FormatElement::Literal(s) if s == "!"));
+    }
+
+    #[test]
+    fn test_expr_format_literal_only() {
+        let scope = BindScope::empty();
+        let result = FormatProcessor::format_with_scope("no directives here", &scope).unwrap();
+        assert_eq!(result, "no directives here");
+    }
+
+    #[test]
+    fn test_expr_format_unmatched_paren_error() {
+        let result = FormatProcessor::parse_format_string("%(account");
+        assert!(result.is_err());
     }
 }

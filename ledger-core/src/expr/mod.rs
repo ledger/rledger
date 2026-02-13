@@ -74,6 +74,28 @@ impl Value {
         }
     }
 
+    /// Convert to a display-appropriate string.
+    ///
+    /// Unlike `Display`, this produces unquoted strings, formatted dates,
+    /// and commodity-aware amount representations suitable for report output.
+    pub fn to_display_string(&self) -> String {
+        match self {
+            Value::Null => String::new(),
+            Value::Bool(b) => if *b { "true" } else { "false" }.to_string(),
+            Value::Integer(i) => i.to_string(),
+            Value::Rational(r) => r.to_string(),
+            Value::Decimal(d) => d.to_string(),
+            Value::Amount(a) => a.to_string(),
+            Value::String(s) => s.clone(), // no quotes
+            Value::Date(d) => d.format("%Y/%m/%d").to_string(),
+            Value::DateTime(dt) => dt.format("%Y/%m/%d %H:%M:%S").to_string(),
+            Value::Sequence(seq) => {
+                seq.iter().map(|v| v.to_display_string()).collect::<Vec<_>>().join(", ")
+            }
+            Value::Regex(r) => format!("/{}/", r),
+        }
+    }
+
     /// Get the type name for error messages
     pub fn type_name(&self) -> &'static str {
         match self {
