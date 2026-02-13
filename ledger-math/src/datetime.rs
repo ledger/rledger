@@ -737,7 +737,7 @@ fn is_leap_year(year: i32) -> bool {
     (year % 4 == 0 && year % 100 != 0) || (year % 400 == 0)
 }
 
-fn add_months_to_date(date: NaiveDate, months: i32) -> NaiveDate {
+pub fn add_months_to_date(date: NaiveDate, months: i32) -> NaiveDate {
     let mut new_year = date.year();
     let mut new_month = date.month() as i32 + months;
     while new_month > 12 {
@@ -752,7 +752,7 @@ fn add_months_to_date(date: NaiveDate, months: i32) -> NaiveDate {
     NaiveDate::from_ymd_opt(new_year, new_month as u32, new_day).unwrap_or(date)
 }
 
-fn add_years_to_date(date: NaiveDate, years: i32) -> NaiveDate {
+pub fn add_years_to_date(date: NaiveDate, years: i32) -> NaiveDate {
     let new_year = date.year() + years;
     let new_day = if date.month() == 2 && date.day() == 29 && !is_leap_year(new_year) {
         28
@@ -779,150 +779,26 @@ pub enum PeriodParseError {
     MissingPeriod,
 }
 
-/// Parse a period expression string into a DateInterval
+/// Parse a period expression string into a DateInterval.
+///
+/// Supports the full period expression grammar including:
+/// - Simple periods: "daily", "weekly", "monthly", "quarterly", "yearly"
+/// - Every N: "every 2 weeks", "every 3 months"
+/// - Date ranges: "from 2024/01/01 to 2024/12/31"
+/// - Relative: "this month", "last year", "next quarter"
+/// - Ago/hence: "3 months ago", "2 years hence"
+/// - Dash ranges: "2024/01 - 2024/06"
+/// - Month names: "in February", "February 2024"
+/// - Combined: "monthly from 2024/01 to 2024/12"
 pub fn parse_period(input: &str) -> Result<DateInterval, PeriodParseError> {
-    let input = input.trim().to_lowercase();
+    let input = input.trim();
     if input.is_empty() {
         return Err(PeriodParseError::MissingPeriod);
     }
 
-    match input.as_str() {
-        "daily" => return Ok(DateInterval::from_period(Period::Daily(1))),
-        "weekly" => return Ok(DateInterval::from_period(Period::Weekly(1))),
-        "biweekly" => return Ok(DateInterval::from_period(Period::Biweekly)),
-        "monthly" => return Ok(DateInterval::from_period(Period::Monthly(1))),
-        "bimonthly" => return Ok(DateInterval::from_period(Period::Bimonthly)),
-        "quarterly" => return Ok(DateInterval::from_period(Period::Quarterly(1))),
-        "yearly" => return Ok(DateInterval::from_period(Period::Yearly(1))),
-        _ => {}
-    }
-
-    if let Some(rest) = input.strip_prefix("every ") {
-        return parse_every_period(rest);
-    }
-
-    if input.starts_with("last ") || input.starts_with("next ") || input.starts_with("this ") {
-        return parse_relative_period_expr(&input);
-    }
-
-    Err(PeriodParseError::InvalidFormat(input))
-}
-
-fn parse_every_period(input: &str) -> Result<DateInterval, PeriodParseError> {
-    let parts: Vec<&str> = input.split_whitespace().collect();
-    if parts.len() == 1 {
-        return match parts[0] {
-            "day" => Ok(DateInterval::from_period(Period::Daily(1))),
-            "week" => Ok(DateInterval::from_period(Period::Weekly(1))),
-            "month" => Ok(DateInterval::from_period(Period::Monthly(1))),
-            "quarter" => Ok(DateInterval::from_period(Period::Quarterly(1))),
-            "year" => Ok(DateInterval::from_period(Period::Yearly(1))),
-            _ => Err(PeriodParseError::UnknownKeyword(parts[0].to_string())),
-        };
-    }
-    if parts.len() == 2 {
-        let n: u32 = parts[0]
-            .parse()
-            .map_err(|_| PeriodParseError::InvalidNumber(parts[0].to_string()))?;
-        return match parts[1] {
-            "day" | "days" => Ok(DateInterval::from_period(Period::Daily(n))),
-            "week" | "weeks" => Ok(DateInterval::from_period(Period::Weekly(n))),
-            "month" | "months" => Ok(DateInterval::from_period(Period::Monthly(n))),
-            "quarter" | "quarters" => Ok(DateInterval::from_period(Period::Quarterly(n))),
-            "year" | "years" => Ok(DateInterval::from_period(Period::Yearly(n))),
-            _ => Err(PeriodParseError::UnknownKeyword(parts[1].to_string())),
-        };
-    }
-    Err(PeriodParseError::InvalidFormat(input.to_string()))
-}
-
-fn parse_relative_period_expr(input: &str) -> Result<DateInterval, PeriodParseError> {
-    let parts: Vec<&str> = input.split_whitespace().collect();
-    if parts.len() != 2 {
-        return Err(PeriodParseError::InvalidFormat(input.to_string()));
-    }
-    let modifier = parts[0];
-    let period_name = parts[1];
-    let today = current_date();
-
-    let (start, end) = match period_name {
-        "day" => {
-            let date = match modifier {
-                "last" => today - chrono::Duration::days(1),
-                "next" => today + chrono::Duration::days(1),
-                "this" => today,
-                _ => return Err(PeriodParseError::UnknownKeyword(modifier.to_string())),
-            };
-            (date, date + chrono::Duration::days(1))
-        }
-        "week" => {
-            let start_of_week = {
-                let days_since_sunday = today.weekday().num_days_from_sunday();
-                today - chrono::Duration::days(days_since_sunday as i64)
-            };
-            match modifier {
-                "last" => {
-                    let s = start_of_week - chrono::Duration::days(7);
-                    (s, s + chrono::Duration::days(7))
-                }
-                "next" => {
-                    let s = start_of_week + chrono::Duration::days(7);
-                    (s, s + chrono::Duration::days(7))
-                }
-                "this" => (start_of_week, start_of_week + chrono::Duration::days(7)),
-                _ => return Err(PeriodParseError::UnknownKeyword(modifier.to_string())),
-            }
-        }
-        "month" => {
-            let som = NaiveDate::from_ymd_opt(today.year(), today.month(), 1)
-                .ok_or_else(|| PeriodParseError::InvalidFormat("Invalid month".into()))?;
-            match modifier {
-                "last" => {
-                    let prev = add_months_to_date(som, -1);
-                    let prev_som = NaiveDate::from_ymd_opt(prev.year(), prev.month(), 1)
-                        .unwrap_or(prev);
-                    (prev_som, som)
-                }
-                "next" => {
-                    let next_som = add_months_to_date(som, 1);
-                    let after = add_months_to_date(som, 2);
-                    (next_som, after)
-                }
-                "this" => {
-                    let next_som = add_months_to_date(som, 1);
-                    (som, next_som)
-                }
-                _ => return Err(PeriodParseError::UnknownKeyword(modifier.to_string())),
-            }
-        }
-        "year" => {
-            let soy = NaiveDate::from_ymd_opt(today.year(), 1, 1)
-                .ok_or_else(|| PeriodParseError::InvalidFormat("Invalid year".into()))?;
-            match modifier {
-                "last" => {
-                    let prev = NaiveDate::from_ymd_opt(today.year() - 1, 1, 1)
-                        .ok_or_else(|| PeriodParseError::InvalidFormat("Invalid year".into()))?;
-                    (prev, soy)
-                }
-                "next" => {
-                    let next = NaiveDate::from_ymd_opt(today.year() + 1, 1, 1)
-                        .ok_or_else(|| PeriodParseError::InvalidFormat("Invalid year".into()))?;
-                    let after = NaiveDate::from_ymd_opt(today.year() + 2, 1, 1)
-                        .ok_or_else(|| PeriodParseError::InvalidFormat("Invalid year".into()))?;
-                    (next, after)
-                }
-                "this" => {
-                    let next = NaiveDate::from_ymd_opt(today.year() + 1, 1, 1)
-                        .ok_or_else(|| PeriodParseError::InvalidFormat("Invalid year".into()))?;
-                    (soy, next)
-                }
-                _ => return Err(PeriodParseError::UnknownKeyword(modifier.to_string())),
-            }
-        }
-        _ => return Err(PeriodParseError::UnknownKeyword(period_name.to_string())),
-    };
-
-    Ok(DateInterval::from_range(start, end, false))
+    let tokens = crate::period_parser::tokenize_period(input);
+    let expr = crate::period_parser::parse_period_expression(&tokens)?;
+    Ok(crate::period_parser::period_expression_to_interval(&expr))
 }
 
 /// Timezone utilities

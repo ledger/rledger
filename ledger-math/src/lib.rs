@@ -13,6 +13,7 @@ pub mod balance;
 pub mod commodity;
 pub mod datetime;
 pub mod formatting;
+pub mod period_parser;
 
 // Re-export main types
 pub use amount::{Amount, AmountError, AmountResult, Precision, EXTEND_BY_DIGITS};
@@ -26,6 +27,10 @@ pub use datetime::{
     parse_datetime, parse_period, set_epoch, timezone, Date, DateDuration, DateDurationCompound,
     DateInterval, DateIntervalIterator, DateTimeError, DateTimeResult, FormatType, LocalDateTime,
     Period, PeriodParseError, DEFAULT_TIMEZONE,
+};
+pub use period_parser::{
+    parse_period_expression, period_expression_to_interval, tokenize_period, PeriodExpression,
+    PeriodToken,
 };
 pub use formatting::{
     apply_width_formatting, format_amount, format_balance, format_rational, FormatConfig,
