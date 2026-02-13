@@ -10,10 +10,19 @@
 
 use std::collections::HashMap;
 
+use chrono::NaiveDate;
 use ledger_math::amount::Amount;
+use ledger_math::datetime::Period;
 
+use crate::expr::{ExprContext, Expression, Value};
 use crate::posting::Posting;
 use crate::transaction::Transaction;
+
+/// Predicate function type for filtering postings.
+type PostingPredicate = dyn Fn(&Posting, &Transaction) -> bool;
+
+/// Key extraction function type for sorting postings.
+type PostingSortKey = dyn Fn(&Posting, &Transaction) -> String;
 
 /// A handler in the posting processing pipeline.
 ///
@@ -134,7 +143,7 @@ impl PostHandler for CountHandler {
 /// Handler that forwards postings to the next handler only when a
 /// predicate returns `true`.
 pub struct FilterHandler {
-    predicate: Box<dyn Fn(&Posting, &Transaction) -> bool>,
+    predicate: Box<PostingPredicate>,
     next: Box<dyn PostHandler>,
 }
 
@@ -231,7 +240,7 @@ impl PostHandler for CalcHandler {
 /// sorts them by a caller-supplied key before forwarding to the next handler.
 pub struct SortHandler {
     buffer: Vec<(Posting, Transaction)>,
-    sort_key: Box<dyn Fn(&Posting, &Transaction) -> String>,
+    sort_key: Box<PostingSortKey>,
     reverse: bool,
     next: Box<dyn PostHandler>,
 }
@@ -327,6 +336,385 @@ impl PostHandler for CollapseHandler {
 }
 
 // ---------------------------------------------------------------------------
+// SubtotalHandler — groups postings by account and produces subtotals
+// ---------------------------------------------------------------------------
+
+/// Handler that groups postings by account name and produces one
+/// synthetic posting per account with the subtotaled amount on flush.
+pub struct SubtotalHandler {
+    subtotals: HashMap<String, Amount>,
+    /// Keep a representative (posting, transaction) per account for
+    /// reconstructing the forwarded posting.
+    representatives: HashMap<String, (Posting, Transaction)>,
+    next: Box<dyn PostHandler>,
+}
+
+impl SubtotalHandler {
+    pub fn new(next: Box<dyn PostHandler>) -> Self {
+        Self {
+            subtotals: HashMap::new(),
+            representatives: HashMap::new(),
+            next,
+        }
+    }
+}
+
+impl PostHandler for SubtotalHandler {
+    fn handle(&mut self, posting: &Posting, transaction: &Transaction) {
+        let account_name = posting.account_name();
+
+        if let Some(total) = self.subtotals.get_mut(&account_name) {
+            if let Some(ref amount) = posting.amount {
+                let _ = total.add_amount(amount);
+            }
+        } else {
+            let initial = posting.amount.clone().unwrap_or_else(Amount::null);
+            self.subtotals.insert(account_name.clone(), initial);
+            self.representatives
+                .insert(account_name, (posting.clone(), transaction.clone()));
+        }
+    }
+
+    fn flush(&mut self) {
+        for (name, total) in self.subtotals.drain() {
+            if let Some((mut posting, transaction)) = self.representatives.remove(&name) {
+                posting.amount = Some(total);
+                self.next.handle(&posting, &transaction);
+            }
+        }
+        self.next.flush();
+    }
+
+    fn description(&self) -> &str {
+        "SubtotalHandler"
+    }
+}
+
+// ---------------------------------------------------------------------------
+// IntervalHandler — groups postings into time intervals
+// ---------------------------------------------------------------------------
+
+/// Handler that groups postings into time intervals (daily, weekly,
+/// monthly, etc.) and subtotals within each interval. On flush the
+/// final period's subtotals are emitted.
+pub struct IntervalHandler {
+    period: Period,
+    current_period_start: Option<NaiveDate>,
+    current_subtotals: HashMap<String, Amount>,
+    current_representatives: HashMap<String, (Posting, Transaction)>,
+    next: Box<dyn PostHandler>,
+}
+
+impl IntervalHandler {
+    pub fn new(period: Period, next: Box<dyn PostHandler>) -> Self {
+        Self {
+            period,
+            current_period_start: None,
+            current_subtotals: HashMap::new(),
+            current_representatives: HashMap::new(),
+            next,
+        }
+    }
+
+    /// Determine the period start date for a given date by finding the
+    /// beginning of the period that contains the date.
+    fn period_start_for(&self, date: NaiveDate) -> NaiveDate {
+        use chrono::Datelike;
+        match &self.period {
+            Period::Daily(_) => date,
+            Period::Weekly(_) => {
+                // Start of ISO week (Monday)
+                let weekday = date.weekday().num_days_from_monday();
+                date - chrono::Duration::days(weekday as i64)
+            }
+            Period::Biweekly => {
+                let weekday = date.weekday().num_days_from_monday();
+                date - chrono::Duration::days(weekday as i64)
+            }
+            Period::Monthly(_) | Period::Bimonthly => {
+                NaiveDate::from_ymd_opt(date.year(), date.month(), 1).unwrap_or(date)
+            }
+            Period::Quarterly(_) => {
+                let quarter_month = ((date.month() - 1) / 3) * 3 + 1;
+                NaiveDate::from_ymd_opt(date.year(), quarter_month, 1).unwrap_or(date)
+            }
+            Period::Yearly(_) => {
+                NaiveDate::from_ymd_opt(date.year(), 1, 1).unwrap_or(date)
+            }
+        }
+    }
+
+    /// Flush the current period's subtotals to the next handler.
+    fn flush_current_period(&mut self) {
+        for (name, total) in self.current_subtotals.drain() {
+            if let Some((mut posting, transaction)) = self.current_representatives.remove(&name) {
+                posting.amount = Some(total);
+                self.next.handle(&posting, &transaction);
+            }
+        }
+    }
+
+    /// Accumulate a posting into the current period.
+    fn accumulate(&mut self, posting: &Posting, transaction: &Transaction) {
+        let account_name = posting.account_name();
+
+        if let Some(total) = self.current_subtotals.get_mut(&account_name) {
+            if let Some(ref amount) = posting.amount {
+                let _ = total.add_amount(amount);
+            }
+        } else {
+            let initial = posting.amount.clone().unwrap_or_else(Amount::null);
+            self.current_subtotals.insert(account_name.clone(), initial);
+            self.current_representatives
+                .insert(account_name, (posting.clone(), transaction.clone()));
+        }
+    }
+}
+
+impl PostHandler for IntervalHandler {
+    fn handle(&mut self, posting: &Posting, transaction: &Transaction) {
+        let date = transaction.date;
+        let period_start = self.period_start_for(date);
+
+        match self.current_period_start {
+            Some(current_start) if current_start != period_start => {
+                // New period — flush the old one first.
+                self.flush_current_period();
+                self.current_period_start = Some(period_start);
+                self.accumulate(posting, transaction);
+            }
+            None => {
+                self.current_period_start = Some(period_start);
+                self.accumulate(posting, transaction);
+            }
+            Some(_) => {
+                // Same period — just accumulate.
+                self.accumulate(posting, transaction);
+            }
+        }
+    }
+
+    fn flush(&mut self) {
+        self.flush_current_period();
+        self.next.flush();
+    }
+
+    fn description(&self) -> &str {
+        "IntervalHandler"
+    }
+}
+
+// ---------------------------------------------------------------------------
+// DisplayFilterHandler — expression-based display predicate
+// ---------------------------------------------------------------------------
+
+/// Handler that evaluates an [`Expression`] predicate against each
+/// posting and only forwards those for which the expression is truthy.
+///
+/// Unlike [`FilterHandler`] (which uses closures), this handler uses
+/// the expression engine so predicates can reference computed values
+/// like running totals.
+pub struct DisplayFilterHandler {
+    predicate: Expression,
+    next: Box<dyn PostHandler>,
+}
+
+impl DisplayFilterHandler {
+    pub fn new(predicate: Expression, next: Box<dyn PostHandler>) -> Self {
+        Self { predicate, next }
+    }
+}
+
+impl PostHandler for DisplayFilterHandler {
+    fn handle(&mut self, posting: &Posting, transaction: &Transaction) {
+        // Build a minimal context exposing the posting's amount and
+        // running total so the expression can reference them.
+        let mut ctx = ExprContext::new();
+
+        if let Some(ref amount) = posting.amount {
+            ctx.set_variable("amount".to_string(), Value::Amount(amount.clone()));
+        } else {
+            ctx.set_variable("amount".to_string(), Value::Null);
+        }
+
+        if let Some(ref xdata) = posting.xdata {
+            if let Some(ref total) = xdata.total {
+                ctx.set_variable("total".to_string(), Value::Amount(total.clone()));
+            }
+        }
+
+        ctx.set_variable(
+            "account".to_string(),
+            Value::String(posting.account_name()),
+        );
+        ctx.set_variable(
+            "payee".to_string(),
+            Value::String(transaction.payee.clone()),
+        );
+
+        match self.predicate.evaluate(&ctx) {
+            Ok(value) if value.is_truthy() => {
+                self.next.handle(posting, transaction);
+            }
+            _ => {}
+        }
+    }
+
+    fn flush(&mut self) {
+        self.next.flush();
+    }
+
+    fn description(&self) -> &str {
+        "DisplayFilterHandler"
+    }
+}
+
+// ---------------------------------------------------------------------------
+// RelatedHandler — forwards related postings from the same transaction
+// ---------------------------------------------------------------------------
+
+/// For each posting received, forwards the *other* postings in the
+/// same transaction (the "related" postings). If `also_matching` is
+/// `true`, the original posting is forwarded too.
+pub struct RelatedHandler {
+    also_matching: bool,
+    next: Box<dyn PostHandler>,
+}
+
+impl RelatedHandler {
+    pub fn new(also_matching: bool, next: Box<dyn PostHandler>) -> Self {
+        Self { also_matching, next }
+    }
+}
+
+impl PostHandler for RelatedHandler {
+    fn handle(&mut self, posting: &Posting, transaction: &Transaction) {
+        if self.also_matching {
+            self.next.handle(posting, transaction);
+        }
+
+        // Forward all other postings from the same transaction.
+        let posting_account = posting.account_name();
+        let posting_seq = posting.sequence;
+
+        for related in &transaction.postings {
+            // Skip the original posting (match by sequence and account).
+            if related.sequence == posting_seq && related.account_name() == posting_account {
+                continue;
+            }
+            self.next.handle(related, transaction);
+        }
+    }
+
+    fn flush(&mut self) {
+        self.next.flush();
+    }
+
+    fn description(&self) -> &str {
+        "RelatedHandler"
+    }
+}
+
+// ---------------------------------------------------------------------------
+// TruncateHandler — limits output to first N or last N postings
+// ---------------------------------------------------------------------------
+
+/// Handler that limits output to the first N (`head_count`) or last N
+/// (`tail_count`) postings. If both are set, head takes precedence.
+pub struct TruncateHandler {
+    head_count: Option<usize>,
+    tail_count: Option<usize>,
+    buffer: Vec<(Posting, Transaction)>,
+    count: usize,
+    next: Box<dyn PostHandler>,
+}
+
+impl TruncateHandler {
+    pub fn head(n: usize, next: Box<dyn PostHandler>) -> Self {
+        Self {
+            head_count: Some(n),
+            tail_count: None,
+            buffer: Vec::new(),
+            count: 0,
+            next,
+        }
+    }
+
+    pub fn tail(n: usize, next: Box<dyn PostHandler>) -> Self {
+        Self {
+            head_count: None,
+            tail_count: Some(n),
+            buffer: Vec::new(),
+            count: 0,
+            next,
+        }
+    }
+}
+
+impl PostHandler for TruncateHandler {
+    fn handle(&mut self, posting: &Posting, transaction: &Transaction) {
+        if let Some(head) = self.head_count {
+            // Head mode: forward immediately until we've sent enough.
+            if self.count < head {
+                self.next.handle(posting, transaction);
+                self.count += 1;
+            }
+        } else {
+            // Tail mode: buffer everything; we'll pick the last N on flush.
+            self.buffer.push((posting.clone(), transaction.clone()));
+        }
+    }
+
+    fn flush(&mut self) {
+        if let Some(tail) = self.tail_count {
+            let skip = self.buffer.len().saturating_sub(tail);
+            for (posting, transaction) in self.buffer.drain(..).skip(skip) {
+                self.next.handle(&posting, &transaction);
+            }
+        }
+        self.next.flush();
+    }
+
+    fn description(&self) -> &str {
+        "TruncateHandler"
+    }
+}
+
+// ---------------------------------------------------------------------------
+// InvertHandler — negates all posting amounts
+// ---------------------------------------------------------------------------
+
+/// Handler that negates every posting's amount before forwarding it
+/// to the next handler.
+pub struct InvertHandler {
+    next: Box<dyn PostHandler>,
+}
+
+impl InvertHandler {
+    pub fn new(next: Box<dyn PostHandler>) -> Self {
+        Self { next }
+    }
+}
+
+impl PostHandler for InvertHandler {
+    fn handle(&mut self, posting: &Posting, transaction: &Transaction) {
+        let mut inverted = posting.clone();
+        if let Some(ref amount) = inverted.amount {
+            inverted.amount = Some(amount.negated());
+        }
+        self.next.handle(&inverted, transaction);
+    }
+
+    fn flush(&mut self) {
+        self.next.flush();
+    }
+
+    fn description(&self) -> &str {
+        "InvertHandler"
+    }
+}
+
+// ---------------------------------------------------------------------------
 // PipelineBuilder — ergonomic pipeline construction
 // ---------------------------------------------------------------------------
 
@@ -389,6 +777,41 @@ impl PipelineBuilder {
     /// Wrap the current pipeline with a [`CalcHandler`].
     pub fn calc(self) -> Self {
         Self { current: Box::new(CalcHandler::new(self.current)) }
+    }
+
+    /// Wrap the current pipeline with a [`SubtotalHandler`].
+    pub fn subtotal(self) -> Self {
+        Self { current: Box::new(SubtotalHandler::new(self.current)) }
+    }
+
+    /// Wrap the current pipeline with an [`IntervalHandler`].
+    pub fn interval(self, period: Period) -> Self {
+        Self { current: Box::new(IntervalHandler::new(period, self.current)) }
+    }
+
+    /// Wrap the current pipeline with a [`DisplayFilterHandler`].
+    pub fn display_filter(self, expr: Expression) -> Self {
+        Self { current: Box::new(DisplayFilterHandler::new(expr, self.current)) }
+    }
+
+    /// Wrap the current pipeline with a [`RelatedHandler`].
+    pub fn related(self, also_matching: bool) -> Self {
+        Self { current: Box::new(RelatedHandler::new(also_matching, self.current)) }
+    }
+
+    /// Wrap the current pipeline with a [`TruncateHandler`] that keeps the first N.
+    pub fn truncate_head(self, n: usize) -> Self {
+        Self { current: Box::new(TruncateHandler::head(n, self.current)) }
+    }
+
+    /// Wrap the current pipeline with a [`TruncateHandler`] that keeps the last N.
+    pub fn truncate_tail(self, n: usize) -> Self {
+        Self { current: Box::new(TruncateHandler::tail(n, self.current)) }
+    }
+
+    /// Wrap the current pipeline with an [`InvertHandler`].
+    pub fn invert(self) -> Self {
+        Self { current: Box::new(InvertHandler::new(self.current)) }
     }
 
     /// Consume the builder and return the composed pipeline.
@@ -900,6 +1323,451 @@ mod tests {
         assert_eq!(r[1].0.amount.as_ref().unwrap().value(), Decimal::from(500));
     }
 
+    // -- SubtotalHandler ----------------------------------------------------
+
+    #[test]
+    fn subtotal_handler_groups_by_account() {
+        let mut tree = AccountTree::new();
+        let p1 = make_posting(&mut tree, "Expenses:Food", 30);
+        let p2 = make_posting(&mut tree, "Assets:Cash", -30);
+        let p3 = make_posting(&mut tree, "Expenses:Food", 20);
+        let txn = make_transaction((2024, 1, 15), "Various");
+
+        use std::cell::RefCell;
+        use std::rc::Rc;
+
+        let results: Rc<RefCell<Vec<(Posting, Transaction)>>> =
+            Rc::new(RefCell::new(Vec::new()));
+        let results_clone = Rc::clone(&results);
+
+        struct SharedCollector {
+            results: Rc<RefCell<Vec<(Posting, Transaction)>>>,
+        }
+        impl PostHandler for SharedCollector {
+            fn handle(&mut self, posting: &Posting, transaction: &Transaction) {
+                self.results.borrow_mut().push((posting.clone(), transaction.clone()));
+            }
+            fn flush(&mut self) {}
+            fn description(&self) -> &str {
+                "SharedCollector"
+            }
+        }
+
+        let mut pipeline = PipelineBuilder::new(Box::new(SharedCollector {
+            results: results_clone,
+        }))
+        .subtotal()
+        .build();
+
+        pipeline.handle(&p1, &txn);
+        pipeline.handle(&p2, &txn);
+        pipeline.handle(&p3, &txn);
+        pipeline.flush();
+
+        let r = results.borrow();
+        assert_eq!(r.len(), 2);
+
+        let food = r.iter().find(|(p, _)| p.account_name() == "Expenses:Food").unwrap();
+        assert_eq!(food.0.amount.as_ref().unwrap().value(), Decimal::from(50));
+
+        let cash = r.iter().find(|(p, _)| p.account_name() == "Assets:Cash").unwrap();
+        assert_eq!(cash.0.amount.as_ref().unwrap().value(), Decimal::from(-30));
+    }
+
+    // -- IntervalHandler ----------------------------------------------------
+
+    #[test]
+    fn interval_handler_groups_by_month() {
+        let mut tree = AccountTree::new();
+        let p_jan = make_posting(&mut tree, "Expenses:Food", 100);
+        let p_jan2 = make_posting(&mut tree, "Expenses:Food", 50);
+        let p_feb = make_posting(&mut tree, "Expenses:Food", 200);
+        let p_mar = make_posting(&mut tree, "Expenses:Food", 300);
+        let txn_jan = make_transaction((2024, 1, 10), "Jan expense");
+        let txn_jan2 = make_transaction((2024, 1, 20), "Jan expense 2");
+        let txn_feb = make_transaction((2024, 2, 15), "Feb expense");
+        let txn_mar = make_transaction((2024, 3, 5), "Mar expense");
+
+        use std::cell::RefCell;
+        use std::rc::Rc;
+
+        let results: Rc<RefCell<Vec<(Posting, Transaction)>>> =
+            Rc::new(RefCell::new(Vec::new()));
+        let results_clone = Rc::clone(&results);
+
+        struct SharedCollector {
+            results: Rc<RefCell<Vec<(Posting, Transaction)>>>,
+        }
+        impl PostHandler for SharedCollector {
+            fn handle(&mut self, posting: &Posting, transaction: &Transaction) {
+                self.results.borrow_mut().push((posting.clone(), transaction.clone()));
+            }
+            fn flush(&mut self) {}
+            fn description(&self) -> &str {
+                "SharedCollector"
+            }
+        }
+
+        let mut pipeline = PipelineBuilder::new(Box::new(SharedCollector {
+            results: results_clone,
+        }))
+        .interval(Period::Monthly(1))
+        .build();
+
+        pipeline.handle(&p_jan, &txn_jan);
+        pipeline.handle(&p_jan2, &txn_jan2);
+        pipeline.handle(&p_feb, &txn_feb);
+        pipeline.handle(&p_mar, &txn_mar);
+        pipeline.flush();
+
+        let r = results.borrow();
+        // 3 groups: Jan (100+50=150), Feb (200), Mar (300)
+        assert_eq!(r.len(), 3);
+
+        // Results come out in period order: Jan first, then Feb, then Mar.
+        assert_eq!(r[0].0.amount.as_ref().unwrap().value(), Decimal::from(150));
+        assert_eq!(r[1].0.amount.as_ref().unwrap().value(), Decimal::from(200));
+        assert_eq!(r[2].0.amount.as_ref().unwrap().value(), Decimal::from(300));
+    }
+
+    // -- DisplayFilterHandler -----------------------------------------------
+
+    #[test]
+    fn display_filter_handler_filters_by_expression() {
+        let mut tree = AccountTree::new();
+        let p_big = make_posting(&mut tree, "Expenses:Food", 100);
+        let p_small = make_posting(&mut tree, "Expenses:Snack", 5);
+        let p_medium = make_posting(&mut tree, "Expenses:Lunch", 25);
+        let txn = make_transaction((2024, 1, 15), "Various");
+
+        use std::cell::RefCell;
+        use std::rc::Rc;
+
+        let results: Rc<RefCell<Vec<(Posting, Transaction)>>> =
+            Rc::new(RefCell::new(Vec::new()));
+        let results_clone = Rc::clone(&results);
+
+        struct SharedCollector {
+            results: Rc<RefCell<Vec<(Posting, Transaction)>>>,
+        }
+        impl PostHandler for SharedCollector {
+            fn handle(&mut self, posting: &Posting, transaction: &Transaction) {
+                self.results.borrow_mut().push((posting.clone(), transaction.clone()));
+            }
+            fn flush(&mut self) {}
+            fn description(&self) -> &str {
+                "SharedCollector"
+            }
+        }
+
+        // Predicate: amount > 10
+        let expr = Expression::parse("amount > 10").unwrap();
+
+        let mut pipeline = PipelineBuilder::new(Box::new(SharedCollector {
+            results: results_clone,
+        }))
+        .display_filter(expr)
+        .build();
+
+        pipeline.handle(&p_big, &txn);
+        pipeline.handle(&p_small, &txn);
+        pipeline.handle(&p_medium, &txn);
+        pipeline.flush();
+
+        let r = results.borrow();
+        assert_eq!(r.len(), 2);
+        assert_eq!(r[0].0.account_name(), "Expenses:Food");
+        assert_eq!(r[1].0.account_name(), "Expenses:Lunch");
+    }
+
+    // -- RelatedHandler -----------------------------------------------------
+
+    #[test]
+    fn related_handler_forwards_related_postings() {
+        let mut tree = AccountTree::new();
+        let p_food = make_posting(&mut tree, "Expenses:Food", 50);
+        let p_cash = make_posting(&mut tree, "Assets:Cash", -50);
+
+        // Build a transaction that contains both postings.
+        let mut txn = make_transaction((2024, 1, 15), "Grocery");
+        txn.postings.push(p_food.clone());
+        txn.postings.push(p_cash.clone());
+
+        use std::cell::RefCell;
+        use std::rc::Rc;
+
+        let results: Rc<RefCell<Vec<(Posting, Transaction)>>> =
+            Rc::new(RefCell::new(Vec::new()));
+        let results_clone = Rc::clone(&results);
+
+        struct SharedCollector {
+            results: Rc<RefCell<Vec<(Posting, Transaction)>>>,
+        }
+        impl PostHandler for SharedCollector {
+            fn handle(&mut self, posting: &Posting, transaction: &Transaction) {
+                self.results.borrow_mut().push((posting.clone(), transaction.clone()));
+            }
+            fn flush(&mut self) {}
+            fn description(&self) -> &str {
+                "SharedCollector"
+            }
+        }
+
+        // Without also_matching: should forward only the *other* postings.
+        let mut pipeline = PipelineBuilder::new(Box::new(SharedCollector {
+            results: results_clone,
+        }))
+        .related(false)
+        .build();
+
+        pipeline.handle(&p_food, &txn);
+        pipeline.flush();
+
+        let r = results.borrow();
+        // p_food is not forwarded (also_matching=false), only p_cash.
+        assert_eq!(r.len(), 1);
+        assert_eq!(r[0].0.account_name(), "Assets:Cash");
+    }
+
+    #[test]
+    fn related_handler_also_matching() {
+        let mut tree = AccountTree::new();
+        let mut p_food = make_posting(&mut tree, "Expenses:Food", 50);
+        p_food.sequence = 1;
+        let mut p_cash = make_posting(&mut tree, "Assets:Cash", -50);
+        p_cash.sequence = 2;
+
+        let mut txn = make_transaction((2024, 1, 15), "Grocery");
+        txn.postings.push(p_food.clone());
+        txn.postings.push(p_cash.clone());
+
+        use std::cell::RefCell;
+        use std::rc::Rc;
+
+        let results: Rc<RefCell<Vec<(Posting, Transaction)>>> =
+            Rc::new(RefCell::new(Vec::new()));
+        let results_clone = Rc::clone(&results);
+
+        struct SharedCollector {
+            results: Rc<RefCell<Vec<(Posting, Transaction)>>>,
+        }
+        impl PostHandler for SharedCollector {
+            fn handle(&mut self, posting: &Posting, transaction: &Transaction) {
+                self.results.borrow_mut().push((posting.clone(), transaction.clone()));
+            }
+            fn flush(&mut self) {}
+            fn description(&self) -> &str {
+                "SharedCollector"
+            }
+        }
+
+        let mut pipeline = PipelineBuilder::new(Box::new(SharedCollector {
+            results: results_clone,
+        }))
+        .related(true)
+        .build();
+
+        pipeline.handle(&p_food, &txn);
+        pipeline.flush();
+
+        let r = results.borrow();
+        // also_matching=true: both the original and the related posting.
+        assert_eq!(r.len(), 2);
+        assert_eq!(r[0].0.account_name(), "Expenses:Food");
+        assert_eq!(r[1].0.account_name(), "Assets:Cash");
+    }
+
+    // -- TruncateHandler ----------------------------------------------------
+
+    #[test]
+    fn truncate_handler_head() {
+        let mut tree = AccountTree::new();
+        let postings: Vec<Posting> = (1..=5)
+            .map(|i| make_posting(&mut tree, &format!("Account:{}", i), i * 10))
+            .collect();
+        let txn = make_transaction((2024, 1, 15), "Test");
+
+        use std::cell::RefCell;
+        use std::rc::Rc;
+
+        let results: Rc<RefCell<Vec<(Posting, Transaction)>>> =
+            Rc::new(RefCell::new(Vec::new()));
+        let results_clone = Rc::clone(&results);
+
+        struct SharedCollector {
+            results: Rc<RefCell<Vec<(Posting, Transaction)>>>,
+        }
+        impl PostHandler for SharedCollector {
+            fn handle(&mut self, posting: &Posting, transaction: &Transaction) {
+                self.results.borrow_mut().push((posting.clone(), transaction.clone()));
+            }
+            fn flush(&mut self) {}
+            fn description(&self) -> &str {
+                "SharedCollector"
+            }
+        }
+
+        let mut pipeline = PipelineBuilder::new(Box::new(SharedCollector {
+            results: results_clone,
+        }))
+        .truncate_head(2)
+        .build();
+
+        for p in &postings {
+            pipeline.handle(p, &txn);
+        }
+        pipeline.flush();
+
+        let r = results.borrow();
+        assert_eq!(r.len(), 2);
+        assert_eq!(r[0].0.amount.as_ref().unwrap().value(), Decimal::from(10));
+        assert_eq!(r[1].0.amount.as_ref().unwrap().value(), Decimal::from(20));
+    }
+
+    #[test]
+    fn truncate_handler_tail() {
+        let mut tree = AccountTree::new();
+        let postings: Vec<Posting> = (1..=5)
+            .map(|i| make_posting(&mut tree, &format!("Account:{}", i), i * 10))
+            .collect();
+        let txn = make_transaction((2024, 1, 15), "Test");
+
+        use std::cell::RefCell;
+        use std::rc::Rc;
+
+        let results: Rc<RefCell<Vec<(Posting, Transaction)>>> =
+            Rc::new(RefCell::new(Vec::new()));
+        let results_clone = Rc::clone(&results);
+
+        struct SharedCollector {
+            results: Rc<RefCell<Vec<(Posting, Transaction)>>>,
+        }
+        impl PostHandler for SharedCollector {
+            fn handle(&mut self, posting: &Posting, transaction: &Transaction) {
+                self.results.borrow_mut().push((posting.clone(), transaction.clone()));
+            }
+            fn flush(&mut self) {}
+            fn description(&self) -> &str {
+                "SharedCollector"
+            }
+        }
+
+        let mut pipeline = PipelineBuilder::new(Box::new(SharedCollector {
+            results: results_clone,
+        }))
+        .truncate_tail(2)
+        .build();
+
+        for p in &postings {
+            pipeline.handle(p, &txn);
+        }
+        pipeline.flush();
+
+        let r = results.borrow();
+        assert_eq!(r.len(), 2);
+        assert_eq!(r[0].0.amount.as_ref().unwrap().value(), Decimal::from(40));
+        assert_eq!(r[1].0.amount.as_ref().unwrap().value(), Decimal::from(50));
+    }
+
+    // -- InvertHandler ------------------------------------------------------
+
+    #[test]
+    fn invert_handler_negates_amounts() {
+        let mut tree = AccountTree::new();
+        let p1 = make_posting(&mut tree, "Expenses:Food", 50);
+        let p2 = make_posting(&mut tree, "Assets:Cash", -30);
+        let txn = make_transaction((2024, 1, 15), "Test");
+
+        use std::cell::RefCell;
+        use std::rc::Rc;
+
+        let results: Rc<RefCell<Vec<(Posting, Transaction)>>> =
+            Rc::new(RefCell::new(Vec::new()));
+        let results_clone = Rc::clone(&results);
+
+        struct SharedCollector {
+            results: Rc<RefCell<Vec<(Posting, Transaction)>>>,
+        }
+        impl PostHandler for SharedCollector {
+            fn handle(&mut self, posting: &Posting, transaction: &Transaction) {
+                self.results.borrow_mut().push((posting.clone(), transaction.clone()));
+            }
+            fn flush(&mut self) {}
+            fn description(&self) -> &str {
+                "SharedCollector"
+            }
+        }
+
+        let mut pipeline = PipelineBuilder::new(Box::new(SharedCollector {
+            results: results_clone,
+        }))
+        .invert()
+        .build();
+
+        pipeline.handle(&p1, &txn);
+        pipeline.handle(&p2, &txn);
+        pipeline.flush();
+
+        let r = results.borrow();
+        assert_eq!(r.len(), 2);
+        assert_eq!(r[0].0.amount.as_ref().unwrap().value(), Decimal::from(-50));
+        assert_eq!(r[1].0.amount.as_ref().unwrap().value(), Decimal::from(30));
+    }
+
+    // -- Pipeline composition with new handlers -----------------------------
+
+    #[test]
+    fn pipeline_filter_subtotal_sort_collect() {
+        let mut tree = AccountTree::new();
+        let p1 = make_posting(&mut tree, "Expenses:Rent", 500);
+        let p2 = make_posting(&mut tree, "Expenses:Food", 30);
+        let p3 = make_posting(&mut tree, "Expenses:Food", 20);
+        let p4 = make_posting(&mut tree, "Assets:Cash", -550);
+        let txn = make_transaction((2024, 1, 15), "Various");
+
+        use std::cell::RefCell;
+        use std::rc::Rc;
+
+        let results: Rc<RefCell<Vec<(Posting, Transaction)>>> =
+            Rc::new(RefCell::new(Vec::new()));
+        let results_clone = Rc::clone(&results);
+
+        struct SharedCollector {
+            results: Rc<RefCell<Vec<(Posting, Transaction)>>>,
+        }
+        impl PostHandler for SharedCollector {
+            fn handle(&mut self, posting: &Posting, transaction: &Transaction) {
+                self.results.borrow_mut().push((posting.clone(), transaction.clone()));
+            }
+            fn flush(&mut self) {}
+            fn description(&self) -> &str {
+                "SharedCollector"
+            }
+        }
+
+        // Pipeline: filter → subtotal → sort → collect.
+        let mut pipeline = PipelineBuilder::new(Box::new(SharedCollector {
+            results: results_clone,
+        }))
+        .sort(|p, _t| p.account_name())
+        .subtotal()
+        .filter(|p, _t| p.account_name().starts_with("Expenses"))
+        .build();
+
+        pipeline.handle(&p1, &txn);
+        pipeline.handle(&p2, &txn);
+        pipeline.handle(&p3, &txn);
+        pipeline.handle(&p4, &txn);
+        pipeline.flush();
+
+        let r = results.borrow();
+        assert_eq!(r.len(), 2); // Food(50) and Rent(500), sorted
+        assert_eq!(r[0].0.account_name(), "Expenses:Food");
+        assert_eq!(r[0].0.amount.as_ref().unwrap().value(), Decimal::from(50));
+        assert_eq!(r[1].0.account_name(), "Expenses:Rent");
+        assert_eq!(r[1].0.amount.as_ref().unwrap().value(), Decimal::from(500));
+    }
+
     // -- Description --------------------------------------------------------
 
     #[test]
@@ -918,5 +1786,24 @@ mod tests {
 
         let collapse = CollapseHandler::new(Box::new(CountHandler::new()));
         assert_eq!(collapse.description(), "CollapseHandler");
+
+        let subtotal = SubtotalHandler::new(Box::new(CountHandler::new()));
+        assert_eq!(subtotal.description(), "SubtotalHandler");
+
+        let interval = IntervalHandler::new(Period::Monthly(1), Box::new(CountHandler::new()));
+        assert_eq!(interval.description(), "IntervalHandler");
+
+        let expr = Expression::parse("amount > 0").unwrap();
+        let display = DisplayFilterHandler::new(expr, Box::new(CountHandler::new()));
+        assert_eq!(display.description(), "DisplayFilterHandler");
+
+        let related = RelatedHandler::new(false, Box::new(CountHandler::new()));
+        assert_eq!(related.description(), "RelatedHandler");
+
+        let trunc = TruncateHandler::head(5, Box::new(CountHandler::new()));
+        assert_eq!(trunc.description(), "TruncateHandler");
+
+        let invert = InvertHandler::new(Box::new(CountHandler::new()));
+        assert_eq!(invert.description(), "InvertHandler");
     }
 }
