@@ -4,6 +4,7 @@
 //! It supports special variables like `account`, `amount`, `date`, `payee`, `note`, `cleared`,
 //! `pending`, and regex matching with optimized evaluation strategies.
 
+use super::scope_impl::{PostingScope, TransactionScope};
 use super::{ExprContext, ExprError, ExprResult, Expression, Value};
 use crate::posting::Posting;
 use crate::transaction::{Transaction, TransactionStatus};
@@ -138,6 +139,33 @@ impl QueryPredicate {
         // Evaluate expression
         let result = self.expression.evaluate(&context)?;
         Ok(result.is_truthy())
+    }
+
+    /// Check if predicate matches a posting using the scope chain.
+    ///
+    /// This creates a `PostingScope` -> `TransactionScope` chain and
+    /// evaluates the expression through `evaluate_in_scope`, which uses
+    /// `Scope::lookup` for variable resolution instead of `ExprContext`.
+    pub fn matches_posting_scope(
+        &self,
+        posting: &Posting,
+        transaction: &Transaction,
+    ) -> bool {
+        let xact_scope = TransactionScope::new(transaction, None);
+        let post_scope = PostingScope::new(posting, Some(transaction), Some(&xact_scope));
+        self.expression
+            .evaluate_in_scope(&post_scope)
+            .map(|v| v.is_truthy())
+            .unwrap_or(false)
+    }
+
+    /// Check if predicate matches a transaction using the scope chain.
+    pub fn matches_transaction_scope(&self, transaction: &Transaction) -> bool {
+        let scope = TransactionScope::new(transaction, None);
+        self.expression
+            .evaluate_in_scope(&scope)
+            .map(|v| v.is_truthy())
+            .unwrap_or(false)
     }
 
     /// Filter a collection of transactions

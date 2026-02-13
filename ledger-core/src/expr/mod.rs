@@ -25,6 +25,8 @@ pub mod functions;
 pub mod op;
 pub mod parser;
 pub mod predicate;
+pub mod scope;
+pub mod scope_impl;
 
 /// Value type that expressions can evaluate to
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -857,6 +859,14 @@ impl Expression {
         evaluate_node(&self.root, context)
     }
 
+    /// Evaluate the expression against a scope chain.
+    ///
+    /// For `Identifier` nodes, uses `scope::resolve()` instead of
+    /// `context.get_variable()`. All other nodes recurse normally.
+    pub fn evaluate_in_scope(&self, scope: &dyn scope::Scope) -> ExprResult<Value> {
+        evaluate_node_in_scope(&self.root, scope)
+    }
+
     /// Check if expression is a constant value
     pub fn is_constant(&self) -> bool {
         is_constant_node(&self.root)
@@ -987,4 +997,202 @@ fn evaluate_user_function(
 ) -> ExprResult<Value> {
     // Placeholder - will be implemented with user function support
     Err(ExprError::RuntimeError("User functions not yet implemented".to_string()))
+}
+
+// ---------------------------------------------------------------------------
+// Scope-based evaluation
+// ---------------------------------------------------------------------------
+
+/// Evaluate an AST node against a scope chain.
+///
+/// Identical to `evaluate_node` except that `Identifier` nodes resolve
+/// through `scope::resolve()` instead of `ExprContext::get_variable()`.
+fn evaluate_node_in_scope(node: &ExprNode, scope: &dyn scope::Scope) -> ExprResult<Value> {
+    match node {
+        ExprNode::Value(v) => Ok(v.clone()),
+
+        ExprNode::Identifier(name) => match scope::resolve(scope, name) {
+            Some(value) => Ok(value),
+            None => {
+                // Mirror the tag-prefix fallback from evaluate_node
+                if name.starts_with("tag_") || name.starts_with("posting_tag_") {
+                    Ok(Value::Null)
+                } else {
+                    Err(ExprError::UnknownVariable(name.clone()))
+                }
+            }
+        },
+
+        ExprNode::Binary { op, left, right } => {
+            evaluate_binary_op_in_scope(*op, left, right, scope)
+        }
+
+        ExprNode::Unary { op, operand } => {
+            let val = evaluate_node_in_scope(operand, scope)?;
+            match op {
+                UnaryOp::Neg => (-val).map_err(|e| ExprError::RuntimeError(e.to_string())),
+                UnaryOp::Not => Ok(Value::Bool(!val.is_truthy())),
+            }
+        }
+
+        ExprNode::FunctionCall { function, args } => {
+            // Evaluate args in scope, then delegate to built-in function logic
+            let mut evaluated = Vec::with_capacity(args.len());
+            for arg in args {
+                evaluated.push(evaluate_node_in_scope(arg, scope)?);
+            }
+            functions::evaluate_builtin_function_with_values(*function, &evaluated)
+        }
+
+        ExprNode::UserFunction { name, .. } => {
+            Err(ExprError::UnknownFunction(name.clone()))
+        }
+
+        ExprNode::Conditional { condition, if_true, if_false } => {
+            let cond_val = evaluate_node_in_scope(condition, scope)?;
+            if cond_val.is_truthy() {
+                evaluate_node_in_scope(if_true, scope)
+            } else {
+                evaluate_node_in_scope(if_false, scope)
+            }
+        }
+
+        ExprNode::Define { value, .. } => evaluate_node_in_scope(value, scope),
+
+        ExprNode::Lambda { .. } => {
+            Err(ExprError::RuntimeError(
+                "Lambda expressions not yet implemented".to_string(),
+            ))
+        }
+
+        ExprNode::Sequence(exprs) => {
+            let mut result = Value::Null;
+            for expr in exprs {
+                result = evaluate_node_in_scope(expr, scope)?;
+            }
+            Ok(result)
+        }
+    }
+}
+
+/// Evaluate a binary operation with scope-based operand evaluation.
+fn evaluate_binary_op_in_scope(
+    op: BinaryOp,
+    left: &ExprNode,
+    right: &ExprNode,
+    scope: &dyn scope::Scope,
+) -> ExprResult<Value> {
+    // Short-circuit logical operators
+    if matches!(op, BinaryOp::And | BinaryOp::Or) {
+        let left_val = evaluate_node_in_scope(left, scope)?;
+        return match op {
+            BinaryOp::And => {
+                if !left_val.is_truthy() {
+                    Ok(Value::Bool(false))
+                } else {
+                    let right_val = evaluate_node_in_scope(right, scope)?;
+                    Ok(Value::Bool(right_val.is_truthy()))
+                }
+            }
+            BinaryOp::Or => {
+                if left_val.is_truthy() {
+                    Ok(Value::Bool(true))
+                } else {
+                    let right_val = evaluate_node_in_scope(right, scope)?;
+                    Ok(Value::Bool(right_val.is_truthy()))
+                }
+            }
+            _ => unreachable!(),
+        };
+    }
+
+    let left_val = evaluate_node_in_scope(left, scope)?;
+    let right_val = evaluate_node_in_scope(right, scope)?;
+
+    // Reuse the existing value-level operations
+    match op {
+        BinaryOp::Add => left_val.add(&right_val),
+        BinaryOp::Sub => left_val.subtract(&right_val),
+        BinaryOp::Mul => left_val.multiply(&right_val),
+        BinaryOp::Div => left_val.divide(&right_val),
+        BinaryOp::Mod => {
+            match (&left_val, &right_val) {
+                (Value::Integer(a), Value::Integer(b)) => {
+                    if *b == 0 {
+                        Err(ExprError::DivisionByZero)
+                    } else {
+                        Ok(Value::Integer(a % b))
+                    }
+                }
+                _ => Err(ExprError::TypeMismatch {
+                    expected: "integers".to_string(),
+                    found: format!("{} % {}", left_val.type_name(), right_val.type_name()),
+                    operation: "modulo".to_string(),
+                }),
+            }
+        }
+        BinaryOp::Eq => Ok(Value::Bool(left_val.equals(&right_val))),
+        BinaryOp::Ne => Ok(Value::Bool(!left_val.equals(&right_val))),
+        BinaryOp::Lt => left_val.compare(&right_val).map(|c| Value::Bool(c == std::cmp::Ordering::Less)),
+        BinaryOp::Gt => left_val.compare(&right_val).map(|c| Value::Bool(c == std::cmp::Ordering::Greater)),
+        BinaryOp::Le => left_val.compare(&right_val).map(|c| Value::Bool(c != std::cmp::Ordering::Greater)),
+        BinaryOp::Ge => left_val.compare(&right_val).map(|c| Value::Bool(c != std::cmp::Ordering::Less)),
+        BinaryOp::Match => {
+            match (&left_val, &right_val) {
+                (Value::String(text), Value::Regex(pattern)) => {
+                    match regex::Regex::new(pattern) {
+                        Ok(re) => Ok(Value::Bool(re.is_match(text))),
+                        Err(e) => Err(ExprError::RuntimeError(
+                            format!("Invalid regex: {}", e),
+                        )),
+                    }
+                }
+                (Value::String(text), Value::String(pattern)) => {
+                    Ok(Value::Bool(text.contains(pattern.as_str())))
+                }
+                _ => Err(ExprError::TypeMismatch {
+                    expected: "string and regex/string".to_string(),
+                    found: format!("{} =~ {}", left_val.type_name(), right_val.type_name()),
+                    operation: "pattern matching".to_string(),
+                }),
+            }
+        }
+        BinaryOp::Cons => {
+            match &right_val {
+                Value::Sequence(seq) => {
+                    let mut new_seq = vec![left_val];
+                    new_seq.extend(seq.iter().cloned());
+                    Ok(Value::Sequence(new_seq))
+                }
+                _ => Ok(Value::Sequence(vec![left_val, right_val])),
+            }
+        }
+        BinaryOp::Seq => Ok(right_val),
+        BinaryOp::And | BinaryOp::Or => unreachable!("Handled above"),
+        BinaryOp::Query | BinaryOp::Colon => Err(ExprError::RuntimeError(
+            "Ternary operator should be handled specially".to_string(),
+        )),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Bridge: Scope for ExprContext
+// ---------------------------------------------------------------------------
+
+impl scope::Scope for ExprContext {
+    fn lookup(&self, name: &str) -> Option<Value> {
+        // Only check this context level, not parent (the Scope chain handles that)
+        self.variables.get(name).cloned()
+    }
+
+    fn parent(&self) -> Option<&dyn scope::Scope> {
+        // ExprContext uses Rc<ExprContext> for parent, which doesn't lend itself
+        // to returning a reference easily. For the bridge, we return None and rely
+        // on ExprContext's own get_variable() for chain walking when used directly.
+        None
+    }
+
+    fn description(&self) -> &str {
+        "expr_context"
+    }
 }

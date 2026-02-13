@@ -62,6 +62,43 @@ pub fn evaluate_builtin_function(
     }
 }
 
+/// Evaluate a built-in function with pre-evaluated argument values.
+///
+/// This is used by the scope-based evaluator which evaluates arguments
+/// itself before calling into the function dispatch.
+pub fn evaluate_builtin_function_with_values(
+    function: BuiltinFunction,
+    args: &[Value],
+) -> ExprResult<Value> {
+    match function {
+        BuiltinFunction::Abs => fn_abs(args),
+        BuiltinFunction::Floor => fn_floor(args),
+        BuiltinFunction::Ceiling => fn_ceiling(args),
+        BuiltinFunction::Round => fn_round(args),
+        BuiltinFunction::Truncate => fn_truncate(args),
+        BuiltinFunction::Min => fn_min(args),
+        BuiltinFunction::Max => fn_max(args),
+        BuiltinFunction::Now => fn_now(args),
+        BuiltinFunction::Today => fn_today(args),
+        BuiltinFunction::Age => fn_age(args),
+        BuiltinFunction::FormatDate => fn_format_date(args),
+        BuiltinFunction::FormatString => fn_format_string(args),
+        BuiltinFunction::ToUpper => fn_to_upper(args),
+        BuiltinFunction::ToLower => fn_to_lower(args),
+        BuiltinFunction::Trim => fn_trim(args),
+        BuiltinFunction::ToString => fn_to_string(args),
+        BuiltinFunction::ToInt => fn_to_int(args),
+        BuiltinFunction::ToDecimal => fn_to_decimal(args),
+        BuiltinFunction::ToAmount => fn_to_amount(args),
+        BuiltinFunction::Sum => fn_sum(args),
+        BuiltinFunction::Count => fn_count(args),
+        BuiltinFunction::Average => fn_average(args),
+        BuiltinFunction::IsEmpty => fn_is_empty(args),
+        BuiltinFunction::Length => fn_length(args),
+        BuiltinFunction::Type => fn_type(args),
+    }
+}
+
 /// Helper function to check argument count
 fn check_arg_count(args: &[Value], expected: usize, function_name: &str) -> ExprResult<()> {
     if args.len() != expected {
