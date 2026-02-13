@@ -17,7 +17,7 @@ use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-use crate::commodity::{Commodity, CommodityRef};
+use crate::commodity::{Annotation, Commodity, CommodityRef, KeepDetails};
 
 /// Precision type for tracking decimal places
 pub type Precision = u16;
@@ -229,6 +229,32 @@ impl Amount {
         result
     }
 
+    /// Compute the multiplicative inverse (1/x) in place
+    ///
+    /// Matches C++ amount_t::in_place_invert(). Swaps numerator and
+    /// denominator of the underlying BigRational. Errors if amount is zero.
+    pub fn in_place_invert(&mut self) -> AmountResult<()> {
+        match &self.quantity {
+            None => Err(AmountError::DivisionByZero),
+            Some(q) => {
+                if q.is_zero() {
+                    return Err(AmountError::DivisionByZero);
+                }
+                self.quantity = Some(q.recip());
+                // Extend precision to avoid loss, matching div_amount behavior
+                self.precision = (self.precision + EXTEND_BY_DIGITS as Precision).min(1024);
+                Ok(())
+            }
+        }
+    }
+
+    /// Get the multiplicative inverse (1/x) of this amount
+    pub fn inverted(&self) -> AmountResult<Self> {
+        let mut result = self.clone();
+        result.in_place_invert()?;
+        Ok(result)
+    }
+
     /// Get the precision of this amount
     pub fn precision(&self) -> Precision {
         self.precision
@@ -244,9 +270,21 @@ impl Amount {
         self.keep_precision = keep;
     }
 
-    /// Get display precision (for now same as precision, will be enhanced later)
+    /// Get display precision
+    ///
+    /// When `keep_precision` is true, returns the amount's own precision.
+    /// When `keep_precision` is false and a commodity exists, returns the
+    /// commodity's display precision. Otherwise returns the amount's precision.
     pub fn display_precision(&self) -> Precision {
-        // TODO: Consider commodity precision settings
+        if self.keep_precision {
+            return self.precision;
+        }
+        if let Some(commodity) = &self.commodity {
+            let cp = commodity.precision();
+            if cp > 0 {
+                return cp;
+            }
+        }
         self.precision
     }
 
@@ -283,6 +321,90 @@ impl Amount {
     pub fn number(&self) -> Self {
         let mut result = self.clone();
         result.clear_commodity();
+        result
+    }
+
+    /// Annotate this amount's commodity with the given annotation.
+    ///
+    /// Creates a new Commodity that carries the annotation and replaces
+    /// the current commodity reference. If the amount has no commodity,
+    /// this is a no-op.
+    pub fn annotate(&mut self, annotation: Annotation) {
+        if let Some(commodity) = &self.commodity {
+            let mut annotated = (**commodity).clone();
+            annotated.set_annotation(annotation);
+            self.commodity = Some(Arc::new(annotated));
+        }
+    }
+
+    /// Check if this amount's commodity has annotations
+    pub fn has_annotation(&self) -> bool {
+        self.commodity.as_ref().map_or(false, |c| c.has_annotation())
+    }
+
+    /// Return a copy of this amount with annotations stripped per `keep_details`.
+    ///
+    /// If the commodity has no annotations, returns a clone unchanged.
+    pub fn strip_annotations(&self, keep: &KeepDetails) -> Self {
+        let mut result = self.clone();
+        if let Some(commodity) = &result.commodity {
+            if commodity.has_annotation() {
+                if keep.keep_all() {
+                    // Keep everything — no stripping needed
+                    return result;
+                }
+
+                let annotation = commodity.annotation();
+                let mut new_annotation = Annotation::new();
+
+                if keep.keep_price {
+                    if let Some(price) = annotation.price() {
+                        new_annotation = Annotation::with_all(
+                            Some(price.clone()),
+                            new_annotation.date().clone(),
+                            new_annotation.tag().clone(),
+                            new_annotation.value_expr().clone(),
+                        );
+                    }
+                }
+                if keep.keep_date {
+                    if let Some(date) = annotation.date() {
+                        new_annotation = Annotation::with_all(
+                            new_annotation.price().clone(),
+                            Some(*date),
+                            new_annotation.tag().clone(),
+                            new_annotation.value_expr().clone(),
+                        );
+                    }
+                }
+                if keep.keep_tag {
+                    if let Some(tag) = annotation.tag() {
+                        new_annotation = Annotation::with_all(
+                            new_annotation.price().clone(),
+                            new_annotation.date().clone(),
+                            Some(tag.clone()),
+                            new_annotation.value_expr().clone(),
+                        );
+                    }
+                }
+
+                if new_annotation.is_empty() {
+                    // Strip all annotations — create bare commodity with same symbol/precision
+                    let bare = Commodity::with_precision(
+                        commodity.symbol(),
+                        commodity.precision(),
+                    );
+                    result.commodity = Some(Arc::new(bare));
+                } else {
+                    let mut new_comm = Commodity::with_precision(
+                        commodity.symbol(),
+                        commodity.precision(),
+                    );
+                    new_comm.set_annotation(new_annotation);
+                    result.commodity = Some(Arc::new(new_comm));
+                }
+            }
+        }
         result
     }
 
@@ -528,15 +650,14 @@ impl Amount {
     }
 
     /// Divide this amount by another amount (in-place)
+    ///
+    /// Division rules match C++ amount_t::in_place_divide():
+    /// - Same commodity: allowed, result is dimensionless (commodity cleared)
+    /// - Different commodities: allowed (e.g., $10 / 5 shares)
+    /// - Only restriction: division by zero
     pub fn div_amount(&mut self, other: &Amount) -> AmountResult<()> {
         if other.is_realzero() {
             return Err(AmountError::DivisionByZero);
-        }
-
-        if let (Some(this), Some(other)) = (self.commodity(), other.commodity()) {
-            if this.symbol() == other.symbol() {
-                return Err(AmountError::CommodityMismatch);
-            }
         }
 
         // Handle null amounts
@@ -548,6 +669,12 @@ impl Amount {
             return Err(AmountError::DivisionByZero);
         }
 
+        // Check if both have the same commodity — if so, result is dimensionless
+        let same_commodity = match (self.commodity(), other.commodity()) {
+            (Some(a), Some(b)) => a.symbol() == b.symbol(),
+            _ => false,
+        };
+
         // Perform division
         if let (Some(a), Some(b)) = (&self.quantity, &other.quantity) {
             self.quantity = Some(a / b);
@@ -555,8 +682,11 @@ impl Amount {
             let new_precision = (self.precision + EXTEND_BY_DIGITS as Precision).min(1024);
             self.precision = new_precision;
 
-            // Preserve commodity from dividend
-            if self.commodity.is_none() && other.commodity.is_some() {
+            if same_commodity {
+                // Same commodity division yields dimensionless result
+                self.commodity = None;
+            } else if self.commodity.is_none() && other.commodity.is_some() {
+                // Preserve commodity from dividend
                 self.commodity = other.commodity.clone();
             }
         }
@@ -1635,5 +1765,206 @@ mod tests {
         // The custom serde implementation should handle the quantity properly
         let null_amount = Amount::null();
         assert!(null_amount.is_null());
+    }
+
+    // --- Tests for div_amount commodity fix ---
+
+    #[test]
+    fn test_div_same_commodity_yields_dimensionless() {
+        let usd = Arc::new(Commodity::with_precision("$", 2));
+        let mut a = Amount::from_i64(10);
+        a.set_commodity(usd.clone());
+        let mut b = Amount::from_i64(2);
+        b.set_commodity(usd);
+
+        a.div_amount(&b).unwrap();
+        assert_eq!(a.to_i64().unwrap(), 5);
+        assert!(!a.has_commodity(), "same-commodity division should clear commodity");
+    }
+
+    #[test]
+    fn test_div_different_commodities_allowed() {
+        let usd = Arc::new(Commodity::new("$"));
+        let shares = Arc::new(Commodity::new("AAPL"));
+        let mut a = Amount::from_i64(100);
+        a.set_commodity(usd);
+        let mut b = Amount::from_i64(5);
+        b.set_commodity(shares);
+
+        // Different commodity division is allowed
+        a.div_amount(&b).unwrap();
+        assert_eq!(a.to_i64().unwrap(), 20);
+        // Dividend commodity ($) is preserved
+        assert!(a.has_commodity());
+        assert_eq!(a.commodity().unwrap().symbol(), "$");
+    }
+
+    #[test]
+    fn test_div_no_commodity_by_commodity() {
+        let usd = Arc::new(Commodity::new("$"));
+        let mut a = Amount::from_i64(10);
+        let mut b = Amount::from_i64(2);
+        b.set_commodity(usd);
+
+        a.div_amount(&b).unwrap();
+        assert_eq!(a.to_i64().unwrap(), 5);
+        // When dividend has no commodity, it picks up divisor's commodity
+        assert!(a.has_commodity());
+        assert_eq!(a.commodity().unwrap().symbol(), "$");
+    }
+
+    // --- Tests for display_precision ---
+
+    #[test]
+    fn test_display_precision_with_commodity() {
+        let usd = Arc::new(Commodity::with_precision("$", 2));
+        let mut amount = Amount::from_decimal(Decimal::new(12345, 4)).unwrap(); // 1.2345, precision=4
+        amount.set_commodity(usd);
+
+        // With keep_precision=false, should use commodity precision (2)
+        assert_eq!(amount.display_precision(), 2);
+    }
+
+    #[test]
+    fn test_display_precision_keep_precision_overrides() {
+        let usd = Arc::new(Commodity::with_precision("$", 2));
+        let mut amount = Amount::from_decimal(Decimal::new(12345, 4)).unwrap(); // precision=4
+        amount.set_commodity(usd);
+        amount.set_keep_precision(true);
+
+        // With keep_precision=true, should use amount's own precision (4)
+        assert_eq!(amount.display_precision(), 4);
+    }
+
+    #[test]
+    fn test_display_precision_no_commodity() {
+        let amount = Amount::from_decimal(Decimal::new(12345, 3)).unwrap(); // precision=3
+        assert_eq!(amount.display_precision(), 3);
+    }
+
+    // --- Tests for inverted/in_place_invert ---
+
+    #[test]
+    fn test_invert_basic() {
+        let amount = Amount::from_i64(4);
+        let inv = amount.inverted().unwrap();
+        // 1/4 = 0.25
+        let val = inv.to_f64().unwrap();
+        assert!((val - 0.25).abs() < 1e-10);
+    }
+
+    #[test]
+    fn test_invert_rational() {
+        // 2/3 inverted should be 3/2
+        let rational = BigRational::new(BigInt::from(2), BigInt::from(3));
+        let amount = Amount::from_rational(rational);
+        let inv = amount.inverted().unwrap();
+        let val = inv.to_f64().unwrap();
+        assert!((val - 1.5).abs() < 1e-10);
+    }
+
+    #[test]
+    fn test_invert_zero_fails() {
+        let amount = Amount::from_i64(0);
+        assert!(amount.inverted().is_err());
+    }
+
+    #[test]
+    fn test_invert_null_fails() {
+        let amount = Amount::null();
+        assert!(amount.inverted().is_err());
+    }
+
+    #[test]
+    fn test_in_place_invert() {
+        let mut amount = Amount::from_i64(5);
+        amount.in_place_invert().unwrap();
+        let val = amount.to_f64().unwrap();
+        assert!((val - 0.2).abs() < 1e-10);
+    }
+
+    // --- Tests for annotation support ---
+
+    #[test]
+    fn test_annotate_amount() {
+        use chrono::NaiveDate;
+        let usd = Arc::new(Commodity::new("$"));
+        let mut amount = Amount::from_i64(100);
+        amount.set_commodity(usd);
+
+        assert!(!amount.has_annotation());
+
+        let date = NaiveDate::from_ymd_opt(2024, 1, 15).unwrap();
+        amount.annotate(Annotation::with_date(date));
+
+        assert!(amount.has_annotation());
+        assert_eq!(amount.commodity().unwrap().symbol(), "$");
+    }
+
+    #[test]
+    fn test_annotate_without_commodity_is_noop() {
+        let mut amount = Amount::from_i64(100);
+        amount.annotate(Annotation::with_tag("lot1".to_string()));
+        assert!(!amount.has_annotation());
+    }
+
+    #[test]
+    fn test_strip_annotations_none() {
+        use chrono::NaiveDate;
+        let usd = Arc::new(Commodity::new("$"));
+        let mut amount = Amount::from_i64(100);
+        amount.set_commodity(usd);
+
+        let date = NaiveDate::from_ymd_opt(2024, 1, 15).unwrap();
+        amount.annotate(Annotation::with_date(date));
+        assert!(amount.has_annotation());
+
+        let stripped = amount.strip_annotations(&KeepDetails::none());
+        assert!(!stripped.has_annotation());
+        assert!(stripped.has_commodity());
+        assert_eq!(stripped.commodity().unwrap().symbol(), "$");
+    }
+
+    #[test]
+    fn test_strip_annotations_keep_all() {
+        use chrono::NaiveDate;
+        let usd = Arc::new(Commodity::new("$"));
+        let mut amount = Amount::from_i64(100);
+        amount.set_commodity(usd);
+
+        let date = NaiveDate::from_ymd_opt(2024, 1, 15).unwrap();
+        amount.annotate(Annotation::with_date(date));
+
+        let kept = amount.strip_annotations(&KeepDetails::all());
+        assert!(kept.has_annotation());
+    }
+
+    #[test]
+    fn test_strip_annotations_selective() {
+        use chrono::NaiveDate;
+        let usd = Arc::new(Commodity::new("$"));
+        let mut amount = Amount::from_i64(100);
+        amount.set_commodity(usd);
+
+        let annotation = Annotation::with_all(
+            None,
+            Some(NaiveDate::from_ymd_opt(2024, 1, 15).unwrap()),
+            Some("lot1".to_string()),
+            None,
+        );
+        amount.annotate(annotation);
+
+        // Keep only date, strip tag
+        let keep = KeepDetails {
+            keep_price: false,
+            keep_date: true,
+            keep_tag: false,
+            only_actuals: false,
+        };
+        let stripped = amount.strip_annotations(&keep);
+        assert!(stripped.has_annotation());
+        let ann = stripped.commodity().unwrap().annotation();
+        assert!(ann.date().is_some());
+        assert!(ann.tag().is_none());
     }
 }
