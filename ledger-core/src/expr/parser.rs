@@ -53,6 +53,9 @@ pub enum Token {
     Comma,
     Semicolon,
 
+    // Member access
+    Dot,
+
     // Special
     EndOfInput,
 }
@@ -152,12 +155,43 @@ impl<'a> Lexer<'a> {
         functions.insert("to_int".to_string(), BuiltinFunction::ToInt);
         functions.insert("to_decimal".to_string(), BuiltinFunction::ToDecimal);
         functions.insert("to_amount".to_string(), BuiltinFunction::ToAmount);
+        functions.insert("to_boolean".to_string(), BuiltinFunction::ToBoolean);
+        functions.insert("to_date".to_string(), BuiltinFunction::ToDate);
+        functions.insert("to_datetime".to_string(), BuiltinFunction::ToDatetime);
+        functions.insert("to_balance".to_string(), BuiltinFunction::ToBalance);
         functions.insert("sum".to_string(), BuiltinFunction::Sum);
         functions.insert("count".to_string(), BuiltinFunction::Count);
         functions.insert("average".to_string(), BuiltinFunction::Average);
         functions.insert("is_empty".to_string(), BuiltinFunction::IsEmpty);
         functions.insert("length".to_string(), BuiltinFunction::Length);
         functions.insert("type".to_string(), BuiltinFunction::Type);
+        // Amount/Value functions
+        functions.insert("quantity".to_string(), BuiltinFunction::Quantity);
+        functions.insert("commodity".to_string(), BuiltinFunction::Commodity);
+        functions.insert("rounded".to_string(), BuiltinFunction::Rounded);
+        functions.insert("unrounded".to_string(), BuiltinFunction::Unrounded);
+        functions.insert("truncated".to_string(), BuiltinFunction::Truncated);
+        functions.insert("strip".to_string(), BuiltinFunction::Strip);
+        functions.insert("scrub".to_string(), BuiltinFunction::Scrub);
+        functions.insert("market".to_string(), BuiltinFunction::Market);
+        functions.insert("exchange".to_string(), BuiltinFunction::Exchange);
+        // Display functions
+        functions.insert("display_amount".to_string(), BuiltinFunction::DisplayAmount);
+        functions.insert("display_total".to_string(), BuiltinFunction::DisplayTotal);
+        functions.insert("justify".to_string(), BuiltinFunction::Justify);
+        functions.insert("quoted".to_string(), BuiltinFunction::Quoted);
+        functions.insert("quoted_rfc".to_string(), BuiltinFunction::QuotedRfc);
+        functions.insert("ansify_if".to_string(), BuiltinFunction::AnsifyIf);
+        functions.insert("should_bold".to_string(), BuiltinFunction::ShouldBold);
+        // Utility (additional)
+        functions.insert("percent".to_string(), BuiltinFunction::Percent);
+        functions.insert("join".to_string(), BuiltinFunction::Join);
+        functions.insert("get_at".to_string(), BuiltinFunction::GetAt);
+        functions.insert("is_seq".to_string(), BuiltinFunction::IsSeq);
+        // Lot/Annotation functions
+        functions.insert("lot_date".to_string(), BuiltinFunction::LotDate);
+        functions.insert("lot_price".to_string(), BuiltinFunction::LotPrice);
+        functions.insert("lot_tag".to_string(), BuiltinFunction::LotTag);
 
         Lexer {
             input: input.chars().peekable(),
@@ -456,6 +490,24 @@ impl<'a> Lexer<'a> {
                         Err(ExprError::ParseError("Expected '||'".to_string()))
                     }
                 }
+                '.' => {
+                    // Dot is member access when it follows an identifier, ), or ]
+                    match &self.last_token {
+                        Some(Token::Identifier(_))
+                        | Some(Token::RightParen)
+                        | Some(Token::RightBracket) => Ok(Token::Dot),
+                        _ => {
+                            // Leading dot before digits: parse as decimal (e.g., .5)
+                            if matches!(self.peek(), Some(c) if c.is_ascii_digit()) {
+                                self.read_number('.')
+                            } else {
+                                Err(ExprError::ParseError(
+                                    "Unexpected '.' (not member access or decimal)".to_string(),
+                                ))
+                            }
+                        }
+                    }
+                }
                 '"' => self.read_string(),
                 '\'' => self.read_single_quoted_string(),
                 ch if ch.is_ascii_digit() => self.read_number(ch),
@@ -545,6 +597,40 @@ impl<'a> ExprParser<'a> {
 
     /// Parse primary expressions (literals, identifiers, parenthesized expressions)
     fn parse_primary(&mut self) -> ExprResult<ExprNode> {
+        let mut node = self.parse_atom()?;
+
+        // Parse postfix operators: function calls and member access
+        loop {
+            match &self.current_token {
+                Token::Dot => {
+                    self.advance()?; // consume '.'
+                    // After '.', both identifiers and function names should
+                    // be treated as member names (e.g., "amount.commodity"
+                    // where "commodity" is registered as a builtin function).
+                    let member = match self.current_token.clone() {
+                        Token::Identifier(name) => name,
+                        Token::Function(f) => f.to_string(),
+                        _ => {
+                            return Err(ExprError::ParseError(
+                                "Expected identifier after '.'".to_string(),
+                            ));
+                        }
+                    };
+                    self.advance()?;
+                    node = ExprNode::MemberAccess {
+                        object: Box::new(node),
+                        member,
+                    };
+                }
+                _ => break,
+            }
+        }
+
+        Ok(node)
+    }
+
+    /// Parse atomic expressions (literals, identifiers, parenthesized expressions, unary ops)
+    fn parse_atom(&mut self) -> ExprResult<ExprNode> {
         match self.current_token.clone() {
             Token::Integer(n) => {
                 self.advance()?;
@@ -731,5 +817,109 @@ mod tests {
             }
             _ => panic!("Expected binary multiplication"),
         }
+    }
+
+    // --- Member access (dot operator) tests ---
+
+    #[test]
+    fn test_parse_member_access() {
+        let expr = parse_expression("post.amount").unwrap();
+        match expr.root {
+            ExprNode::MemberAccess { object, member } => {
+                assert_eq!(*object, ExprNode::Identifier("post".to_string()));
+                assert_eq!(member, "amount");
+            }
+            _ => panic!("Expected MemberAccess, got {:?}", expr.root),
+        }
+    }
+
+    #[test]
+    fn test_parse_chained_member_access() {
+        let expr = parse_expression("post.amount.commodity").unwrap();
+        match expr.root {
+            ExprNode::MemberAccess { object, member } => {
+                assert_eq!(member, "commodity");
+                match *object {
+                    ExprNode::MemberAccess { object: inner, member: inner_member } => {
+                        assert_eq!(*inner, ExprNode::Identifier("post".to_string()));
+                        assert_eq!(inner_member, "amount");
+                    }
+                    _ => panic!("Expected inner MemberAccess"),
+                }
+            }
+            _ => panic!("Expected MemberAccess"),
+        }
+    }
+
+    #[test]
+    fn test_parse_member_access_precedence_over_multiply() {
+        // post.amount * 2: dot binds tighter than *
+        let expr = parse_expression("post.amount * 2").unwrap();
+        match expr.root {
+            ExprNode::Binary { op: BinaryOp::Mul, left, right } => {
+                match *left {
+                    ExprNode::MemberAccess { object, member } => {
+                        assert_eq!(*object, ExprNode::Identifier("post".to_string()));
+                        assert_eq!(member, "amount");
+                    }
+                    _ => panic!("Expected MemberAccess on left side"),
+                }
+                assert_eq!(*right, ExprNode::Value(Value::Integer(2)));
+            }
+            _ => panic!("Expected binary multiplication"),
+        }
+    }
+
+    #[test]
+    fn test_parse_member_access_with_comparison() {
+        // post.amount > 0
+        let expr = parse_expression("post.amount > 0").unwrap();
+        match expr.root {
+            ExprNode::Binary { op: BinaryOp::Gt, left, right } => {
+                match *left {
+                    ExprNode::MemberAccess { object, member } => {
+                        assert_eq!(*object, ExprNode::Identifier("post".to_string()));
+                        assert_eq!(member, "amount");
+                    }
+                    _ => panic!("Expected MemberAccess on left side"),
+                }
+                assert_eq!(*right, ExprNode::Value(Value::Integer(0)));
+            }
+            _ => panic!("Expected binary comparison"),
+        }
+    }
+
+    #[test]
+    fn test_parse_decimal_not_dot() {
+        // 3.14 should parse as a decimal number, not 3.Dot.14
+        use std::str::FromStr;
+        let expr = parse_expression("3.14").unwrap();
+        assert_eq!(
+            expr.root,
+            ExprNode::Value(Value::Decimal(Decimal::from_str("3.14").unwrap()))
+        );
+    }
+
+    #[test]
+    fn test_parse_decimal_plus_integer() {
+        // 3.14 + 1 should work correctly
+        use std::str::FromStr;
+        let expr = parse_expression("3.14 + 1").unwrap();
+        match expr.root {
+            ExprNode::Binary { op: BinaryOp::Add, left, right } => {
+                assert_eq!(
+                    *left,
+                    ExprNode::Value(Value::Decimal(Decimal::from_str("3.14").unwrap()))
+                );
+                assert_eq!(*right, ExprNode::Value(Value::Integer(1)));
+            }
+            _ => panic!("Expected binary addition"),
+        }
+    }
+
+    #[test]
+    fn test_parse_member_access_display() {
+        let expr = parse_expression("post.amount").unwrap();
+        assert_eq!(format!("{}", expr.root), "post.amount");
     }
 }

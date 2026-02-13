@@ -415,4 +415,146 @@ mod tests {
         assert_eq!(txn_scope.description(), "transaction_scope");
         assert_eq!(post_scope.description(), "posting_scope");
     }
+
+    // --- Member access (dot operator) evaluation tests ---
+
+    #[test]
+    fn test_member_access_post_amount() {
+        let (txn, _tree) = make_test_data();
+        let txn_scope = TransactionScope::new(&txn, None);
+        let posting = &txn.postings[1]; // Expenses:Groceries +42.50
+        let post_scope = PostingScope::new(posting, Some(&txn), Some(&txn_scope));
+
+        let expr = crate::expr::Expression::parse("post.amount").unwrap();
+        let result = expr.evaluate_in_scope(&post_scope).unwrap();
+        match result {
+            Value::Amount(a) => assert_eq!(a.value(), Decimal::new(4250, 2)),
+            other => panic!("Expected Amount, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_member_access_xact_date() {
+        let (txn, _tree) = make_test_data();
+        let txn_scope = TransactionScope::new(&txn, None);
+        let posting = &txn.postings[0];
+        let post_scope = PostingScope::new(posting, Some(&txn), Some(&txn_scope));
+
+        let expr = crate::expr::Expression::parse("xact.date").unwrap();
+        let result = expr.evaluate_in_scope(&post_scope).unwrap();
+        assert_eq!(result, Value::Date(NaiveDate::from_ymd_opt(2024, 3, 15).unwrap()));
+    }
+
+    #[test]
+    fn test_member_access_xact_payee() {
+        let (txn, _tree) = make_test_data();
+        let txn_scope = TransactionScope::new(&txn, None);
+        let posting = &txn.postings[0];
+        let post_scope = PostingScope::new(posting, Some(&txn), Some(&txn_scope));
+
+        let expr = crate::expr::Expression::parse("xact.payee").unwrap();
+        let result = expr.evaluate_in_scope(&post_scope).unwrap();
+        assert_eq!(result, Value::String("Whole Foods".into()));
+    }
+
+    #[test]
+    fn test_member_access_post_account() {
+        let (txn, _tree) = make_test_data();
+        let txn_scope = TransactionScope::new(&txn, None);
+        let posting = &txn.postings[1]; // Expenses:Groceries
+        let post_scope = PostingScope::new(posting, Some(&txn), Some(&txn_scope));
+
+        let expr = crate::expr::Expression::parse("post.account").unwrap();
+        let result = expr.evaluate_in_scope(&post_scope).unwrap();
+        match result {
+            Value::String(name) => assert!(name.contains("Groceries")),
+            other => panic!("Expected String, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_member_access_amount_commodity() {
+        let (txn, _tree) = make_test_data();
+        let txn_scope = TransactionScope::new(&txn, None);
+        let posting = &txn.postings[1]; // has USD commodity
+        let post_scope = PostingScope::new(posting, Some(&txn), Some(&txn_scope));
+
+        let expr = crate::expr::Expression::parse("amount.commodity").unwrap();
+        let result = expr.evaluate_in_scope(&post_scope).unwrap();
+        assert_eq!(result, Value::String("USD".into()));
+    }
+
+    #[test]
+    fn test_member_access_post_nonexistent_error() {
+        let (txn, _tree) = make_test_data();
+        let txn_scope = TransactionScope::new(&txn, None);
+        let posting = &txn.postings[0];
+        let post_scope = PostingScope::new(posting, Some(&txn), Some(&txn_scope));
+
+        let expr = crate::expr::Expression::parse("post.nonexistent").unwrap();
+        let result = expr.evaluate_in_scope(&post_scope);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_member_access_precedence_with_multiply() {
+        // post.amount * 2 should parse as (post.amount) * 2
+        // We can't evaluate this fully because Amount * Integer needs matching,
+        // but we can verify the parse is correct and the dot binds tighter.
+        let expr = crate::expr::Expression::parse("post.amount * 2").unwrap();
+        match &expr.root {
+            crate::expr::ExprNode::Binary { op: crate::expr::BinaryOp::Mul, left, .. } => {
+                match left.as_ref() {
+                    crate::expr::ExprNode::MemberAccess { object, member } => {
+                        assert_eq!(
+                            **object,
+                            crate::expr::ExprNode::Identifier("post".to_string())
+                        );
+                        assert_eq!(member, "amount");
+                    }
+                    _ => panic!("Expected MemberAccess on left"),
+                }
+            }
+            _ => panic!("Expected Binary Mul at top level"),
+        }
+    }
+
+    #[test]
+    fn test_member_access_with_comparison() {
+        let (txn, _tree) = make_test_data();
+        let txn_scope = TransactionScope::new(&txn, None);
+        let posting = &txn.postings[1]; // +42.50
+        let _post_scope = PostingScope::new(posting, Some(&txn), Some(&txn_scope));
+
+        let expr = crate::expr::Expression::parse("post.amount > 0").unwrap();
+        // Verify the parse tree structure: dot binds tighter than >
+        match &expr.root {
+            crate::expr::ExprNode::Binary { op: crate::expr::BinaryOp::Gt, left, right } => {
+                match left.as_ref() {
+                    crate::expr::ExprNode::MemberAccess { member, .. } => {
+                        assert_eq!(member, "amount");
+                    }
+                    _ => panic!("Expected MemberAccess on left"),
+                }
+                assert_eq!(
+                    **right,
+                    crate::expr::ExprNode::Value(Value::Integer(0))
+                );
+            }
+            _ => panic!("Expected Binary Gt at top level"),
+        }
+    }
+
+    #[test]
+    fn test_member_access_transaction_alias() {
+        let (txn, _tree) = make_test_data();
+        let txn_scope = TransactionScope::new(&txn, None);
+        let posting = &txn.postings[0];
+        let post_scope = PostingScope::new(posting, Some(&txn), Some(&txn_scope));
+
+        // "transaction.payee" should work the same as "xact.payee"
+        let expr = crate::expr::Expression::parse("transaction.payee").unwrap();
+        let result = expr.evaluate_in_scope(&post_scope).unwrap();
+        assert_eq!(result, Value::String("Whole Foods".into()));
+    }
 }

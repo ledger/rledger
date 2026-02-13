@@ -10,6 +10,7 @@
 //! - Conditional expressions (ternary operator)
 //! - Sequences and lists
 
+use chrono::Datelike;
 use chrono::NaiveDate as Date;
 use chrono::{DateTime, Local};
 use ledger_math::{Amount, BigRational, Decimal};
@@ -547,6 +548,10 @@ pub enum BuiltinFunction {
     ToInt,
     ToDecimal,
     ToAmount,
+    ToBoolean,
+    ToDate,
+    ToDatetime,
+    ToBalance,
 
     // Aggregation functions
     Sum,
@@ -557,6 +562,37 @@ pub enum BuiltinFunction {
     IsEmpty,
     Length,
     Type,
+
+    // Amount/Value functions
+    Quantity,
+    Commodity,
+    Rounded,
+    Unrounded,
+    Truncated,
+    Strip,
+    Scrub,
+    Market,
+    Exchange,
+
+    // Display functions
+    DisplayAmount,
+    DisplayTotal,
+    Justify,
+    Quoted,
+    QuotedRfc,
+    AnsifyIf,
+    ShouldBold,
+
+    // Utility (additional)
+    Percent,
+    Join,
+    GetAt,
+    IsSeq,
+
+    // Lot/Annotation functions
+    LotDate,
+    LotPrice,
+    LotTag,
 }
 
 impl fmt::Display for BuiltinFunction {
@@ -581,12 +617,39 @@ impl fmt::Display for BuiltinFunction {
             BuiltinFunction::ToInt => "to_int",
             BuiltinFunction::ToDecimal => "to_decimal",
             BuiltinFunction::ToAmount => "to_amount",
+            BuiltinFunction::ToBoolean => "to_boolean",
+            BuiltinFunction::ToDate => "to_date",
+            BuiltinFunction::ToDatetime => "to_datetime",
+            BuiltinFunction::ToBalance => "to_balance",
             BuiltinFunction::Sum => "sum",
             BuiltinFunction::Count => "count",
             BuiltinFunction::Average => "average",
             BuiltinFunction::IsEmpty => "is_empty",
             BuiltinFunction::Length => "length",
             BuiltinFunction::Type => "type",
+            BuiltinFunction::Quantity => "quantity",
+            BuiltinFunction::Commodity => "commodity",
+            BuiltinFunction::Rounded => "rounded",
+            BuiltinFunction::Unrounded => "unrounded",
+            BuiltinFunction::Truncated => "truncated",
+            BuiltinFunction::Strip => "strip",
+            BuiltinFunction::Scrub => "scrub",
+            BuiltinFunction::Market => "market",
+            BuiltinFunction::Exchange => "exchange",
+            BuiltinFunction::DisplayAmount => "display_amount",
+            BuiltinFunction::DisplayTotal => "display_total",
+            BuiltinFunction::Justify => "justify",
+            BuiltinFunction::Quoted => "quoted",
+            BuiltinFunction::QuotedRfc => "quoted_rfc",
+            BuiltinFunction::AnsifyIf => "ansify_if",
+            BuiltinFunction::ShouldBold => "should_bold",
+            BuiltinFunction::Percent => "percent",
+            BuiltinFunction::Join => "join",
+            BuiltinFunction::GetAt => "get_at",
+            BuiltinFunction::IsSeq => "is_seq",
+            BuiltinFunction::LotDate => "lot_date",
+            BuiltinFunction::LotPrice => "lot_price",
+            BuiltinFunction::LotTag => "lot_tag",
         };
         write!(f, "{}", name)
     }
@@ -621,6 +684,9 @@ pub enum ExprNode {
 
     /// Lambda expression
     Lambda { params: Vec<String>, body: Box<ExprNode> },
+
+    /// Member access: expr.field_name (O_LOOKUP)
+    MemberAccess { object: Box<ExprNode>, member: String },
 
     /// Sequence of expressions
     Sequence(Vec<ExprNode>),
@@ -718,6 +784,7 @@ impl fmt::Display for ExprNode {
                 }
                 write!(f, " => {})", body)
             }
+            ExprNode::MemberAccess { object, member } => write!(f, "{}.{}", object, member),
             ExprNode::Sequence(exprs) => {
                 write!(f, "(")?;
                 for (i, expr) in exprs.iter().enumerate() {
@@ -905,6 +972,7 @@ fn is_constant_node(node: &ExprNode) -> bool {
         }
         ExprNode::Define { .. } => false,
         ExprNode::Lambda { .. } => false,
+        ExprNode::MemberAccess { .. } => false,
         ExprNode::Sequence(exprs) => exprs.iter().all(is_constant_node),
     }
 }
@@ -956,6 +1024,21 @@ fn evaluate_node(node: &ExprNode, context: &ExprContext) -> ExprResult<Value> {
         ExprNode::Lambda { .. } => {
             // Return the lambda as a value (not supported yet)
             Err(ExprError::RuntimeError("Lambda expressions not yet implemented".to_string()))
+        }
+
+        ExprNode::MemberAccess { object, member } => {
+            // In context-based evaluation, try compound name lookup first
+            // (e.g., "post.amount" → look up "post.amount" as variable)
+            if let ExprNode::Identifier(obj_name) = object.as_ref() {
+                let compound = format!("{}.{}", obj_name, member);
+                if let Some(value) = context.get_variable(&compound) {
+                    return Ok(value.clone());
+                }
+            }
+
+            // Otherwise evaluate the object and access the member on the value
+            let obj_value = evaluate_node(object, context)?;
+            evaluate_member_access(&obj_value, member)
         }
 
         ExprNode::Sequence(exprs) => {
@@ -1063,6 +1146,10 @@ fn evaluate_node_in_scope(node: &ExprNode, scope: &dyn scope::Scope) -> ExprResu
             Err(ExprError::RuntimeError(
                 "Lambda expressions not yet implemented".to_string(),
             ))
+        }
+
+        ExprNode::MemberAccess { object, member } => {
+            evaluate_member_access_in_scope(object, member, scope)
         }
 
         ExprNode::Sequence(exprs) => {
@@ -1173,6 +1260,128 @@ fn evaluate_binary_op_in_scope(
             "Ternary operator should be handled specially".to_string(),
         )),
     }
+}
+
+// ---------------------------------------------------------------------------
+// Member access helpers
+// ---------------------------------------------------------------------------
+
+/// Access a member/field on a resolved Value.
+///
+/// Supports accessing properties of Amount values (quantity, commodity, precision).
+fn evaluate_member_access(value: &Value, member: &str) -> ExprResult<Value> {
+    match value {
+        Value::Amount(amount) => match member {
+            "quantity" => Ok(Value::Decimal(amount.value())),
+            "commodity" => Ok(amount
+                .commodity()
+                .map(|c| Value::String(c.symbol().to_string()))
+                .unwrap_or(Value::Null)),
+            "precision" => Ok(Value::Integer(amount.precision() as i64)),
+            _ => Err(ExprError::RuntimeError(format!(
+                "Unknown field '{}' on amount",
+                member
+            ))),
+        },
+        Value::Date(d) => match member {
+            "year" => Ok(Value::Integer(d.year() as i64)),
+            "month" => Ok(Value::Integer(d.month() as i64)),
+            "day" => Ok(Value::Integer(d.day() as i64)),
+            _ => Err(ExprError::RuntimeError(format!(
+                "Unknown field '{}' on date",
+                member
+            ))),
+        },
+        _ => Err(ExprError::RuntimeError(format!(
+            "Cannot access member '{}' on value of type {}",
+            member,
+            value.type_name()
+        ))),
+    }
+}
+
+/// Evaluate a member access expression within a scope chain.
+///
+/// When the object is an identifier like "post", "xact", "transaction", or
+/// "account", we route the member lookup to the appropriate scope level.
+/// For other cases, we evaluate the object and call `evaluate_member_access`.
+fn evaluate_member_access_in_scope(
+    object: &ExprNode,
+    member: &str,
+    scope: &dyn scope::Scope,
+) -> ExprResult<Value> {
+    if let ExprNode::Identifier(obj_name) = object {
+        match obj_name.as_str() {
+            // "post.X" — the current scope is typically a PostingScope,
+            // so just resolve X directly in the scope chain.
+            "post" | "posting" => {
+                if let Some(val) = scope::resolve(scope, member) {
+                    return Ok(val);
+                }
+                return Err(ExprError::RuntimeError(format!(
+                    "Unknown field '{}' on posting",
+                    member
+                )));
+            }
+            // "xact.X" / "transaction.X" — walk up to the transaction scope
+            // and resolve there.
+            "xact" | "transaction" => {
+                // Walk up the scope chain to find the transaction scope
+                let txn_scope = find_scope_by_description(scope, "transaction_scope");
+                if let Some(ts) = txn_scope {
+                    if let Some(val) = ts.lookup(member) {
+                        return Ok(val);
+                    }
+                }
+                return Err(ExprError::RuntimeError(format!(
+                    "Unknown field '{}' on transaction",
+                    member
+                )));
+            }
+            // "account.X" — resolve via the posting scope's "account" + member
+            "account" => {
+                if member == "name" {
+                    // account.name is the same as the "account" field
+                    if let Some(val) = scope::resolve(scope, "account") {
+                        return Ok(val);
+                    }
+                }
+                return Err(ExprError::RuntimeError(format!(
+                    "Unknown field '{}' on account",
+                    member
+                )));
+            }
+            // "amount.X" — resolve "amount" from scope, then access field
+            "amount" => {
+                if let Some(val) = scope::resolve(scope, "amount") {
+                    return evaluate_member_access(&val, member);
+                }
+                return Err(ExprError::UnknownVariable("amount".to_string()));
+            }
+            _ => {
+                // For any other identifier, try to resolve it and access the member
+                if let Some(val) = scope::resolve(scope, obj_name) {
+                    return evaluate_member_access(&val, member);
+                }
+                return Err(ExprError::UnknownVariable(obj_name.clone()));
+            }
+        }
+    }
+
+    // Non-identifier object: evaluate it and access the member on the result
+    let obj_value = evaluate_node_in_scope(object, scope)?;
+    evaluate_member_access(&obj_value, member)
+}
+
+/// Walk up the scope chain to find a scope with the given description.
+fn find_scope_by_description<'a>(
+    scope: &'a dyn scope::Scope,
+    description: &str,
+) -> Option<&'a dyn scope::Scope> {
+    if scope.description() == description {
+        return Some(scope);
+    }
+    scope.parent().and_then(|p| find_scope_by_description(p, description))
 }
 
 // ---------------------------------------------------------------------------
