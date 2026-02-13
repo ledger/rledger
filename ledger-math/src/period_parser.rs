@@ -555,13 +555,13 @@ impl<'a> Parser<'a> {
                     let y = *y;
                     if y > 31 {
                         self.advance();
-                        return Ok(NaiveDate::from_ymd_opt(y, m, 1).ok_or_else(|| {
+                        return NaiveDate::from_ymd_opt(y, m, 1).ok_or_else(|| {
                             PeriodParseError::InvalidFormat(format!(
                                 "invalid date: {} {}",
                                 tok.month_number().unwrap(),
                                 y
                             ))
-                        })?);
+                        });
                     }
                 }
                 Ok(NaiveDate::from_ymd_opt(today.year(), m, 1).ok_or_else(|| {
@@ -768,7 +768,6 @@ impl<'a> Parser<'a> {
         // Check for "last/next N <units>" pattern
         if matches!(modifier, Some(PeriodToken::Last | PeriodToken::Next)) {
             if let Some(PeriodToken::Number(n)) = self.peek().cloned() {
-                let n = n;
                 self.advance();
                 return self.parse_relative_n_range(result, &modifier.unwrap(), n, today);
             }

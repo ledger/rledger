@@ -425,23 +425,24 @@ macro_rules! ffi_catch {
 
 // Legacy error functions for backward compatibility
 /// Global error message storage (thread-local would be better but this is simpler for FFI)
-static mut LEGACY_LAST_ERROR: Option<CString> = None;
+static LEGACY_LAST_ERROR: std::sync::Mutex<Option<CString>> = std::sync::Mutex::new(None);
 
 /// Set the legacy error message (deprecated - use enhanced error handling)
 fn set_legacy_error(error: &str) {
-    unsafe {
-        LEGACY_LAST_ERROR = CString::new(error).ok();
+    if let Ok(mut guard) = LEGACY_LAST_ERROR.lock() {
+        *guard = CString::new(error).ok();
     }
 }
 
 /// Get the legacy error message (deprecated - use ledger_get_last_error)
 #[no_mangle]
 pub extern "C" fn ledger_get_legacy_error() -> *const c_char {
-    unsafe {
-        match LEGACY_LAST_ERROR.as_ref() {
+    match LEGACY_LAST_ERROR.lock() {
+        Ok(guard) => match guard.as_ref() {
             Some(error) => error.as_ptr(),
             None => null_mut(),
-        }
+        },
+        Err(_) => null_mut(),
     }
 }
 
@@ -449,12 +450,15 @@ pub extern "C" fn ledger_get_legacy_error() -> *const c_char {
 ///
 /// MEMORY SAFETY: Only call this on strings returned by ledger_*_copy_* functions.
 /// DO NOT call this on strings returned by ledger_*_get_* functions (those are borrowed).
+///
+/// # Safety
+///
+/// `s` must be a pointer previously returned by a `ledger_*_copy_*` function,
+/// or null. The pointer must not have been freed already.
 #[no_mangle]
-pub extern "C" fn ledger_free_string(s: *mut c_char) {
+pub unsafe extern "C" fn ledger_free_string(s: *mut c_char) {
     if !s.is_null() {
-        unsafe {
-            let _ = CString::from_raw(s);
-        }
+        let _ = CString::from_raw(s);
     }
 }
 
@@ -1144,29 +1148,32 @@ pub extern "C" fn ledger_journal_process_in_batches(
 
 /// Reference counted journal handle
 pub struct RcJournal {
-    inner: Arc<Journal>,
+    inner: std::rc::Rc<Journal>,
 }
 
 /// Create a new reference-counted journal
 #[no_mangle]
 pub extern "C" fn ledger_rc_journal_new() -> *mut RcJournal {
-    let rc_journal = Box::new(RcJournal { inner: Arc::new(Journal::new()) });
+    let rc_journal = Box::new(RcJournal { inner: std::rc::Rc::new(Journal::new()) });
     Box::into_raw(rc_journal)
 }
 
 /// Clone a reference to the journal (increment reference count)
+///
+/// # Safety
+///
+/// `journal` must be a valid pointer returned by `ledger_rc_journal_new` or
+/// `ledger_rc_journal_clone`, and must not have been freed.
 #[no_mangle]
-pub extern "C" fn ledger_rc_journal_clone(journal: *const RcJournal) -> *mut RcJournal {
+pub unsafe extern "C" fn ledger_rc_journal_clone(journal: *const RcJournal) -> *mut RcJournal {
     if journal.is_null() {
         set_last_error("Null reference-counted journal pointer");
         return null_mut();
     }
 
-    unsafe {
-        let journal_ref = &*journal;
-        let cloned = Box::new(RcJournal { inner: Arc::clone(&journal_ref.inner) });
-        Box::into_raw(cloned)
-    }
+    let journal_ref = &*journal;
+    let cloned = Box::new(RcJournal { inner: std::rc::Rc::clone(&journal_ref.inner) });
+    Box::into_raw(cloned)
 }
 
 /// Free a reference-counted journal handle
@@ -1317,7 +1324,7 @@ mod tests {
         let rc_journal = ledger_rc_journal_new();
         assert!(!rc_journal.is_null());
 
-        let rc_journal_clone = ledger_rc_journal_clone(rc_journal);
+        let rc_journal_clone = unsafe { ledger_rc_journal_clone(rc_journal) };
         assert!(!rc_journal_clone.is_null());
 
         // Both handles should be valid

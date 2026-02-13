@@ -600,30 +600,25 @@ impl<'a> ExprParser<'a> {
         let mut node = self.parse_atom()?;
 
         // Parse postfix operators: function calls and member access
-        loop {
-            match &self.current_token {
-                Token::Dot => {
-                    self.advance()?; // consume '.'
-                    // After '.', both identifiers and function names should
-                    // be treated as member names (e.g., "amount.commodity"
-                    // where "commodity" is registered as a builtin function).
-                    let member = match self.current_token.clone() {
-                        Token::Identifier(name) => name,
-                        Token::Function(f) => f.to_string(),
-                        _ => {
-                            return Err(ExprError::ParseError(
-                                "Expected identifier after '.'".to_string(),
-                            ));
-                        }
-                    };
-                    self.advance()?;
-                    node = ExprNode::MemberAccess {
-                        object: Box::new(node),
-                        member,
-                    };
+        while let Token::Dot = &self.current_token {
+            self.advance()?; // consume '.'
+            // After '.', both identifiers and function names should
+            // be treated as member names (e.g., "amount.commodity"
+            // where "commodity" is registered as a builtin function).
+            let member = match self.current_token.clone() {
+                Token::Identifier(name) => name,
+                Token::Function(f) => f.to_string(),
+                _ => {
+                    return Err(ExprError::ParseError(
+                        "Expected identifier after '.'".to_string(),
+                    ));
                 }
-                _ => break,
-            }
+            };
+            self.advance()?;
+            node = ExprNode::MemberAccess {
+                object: Box::new(node),
+                member,
+            };
         }
 
         Ok(node)

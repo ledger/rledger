@@ -339,7 +339,7 @@ impl Amount {
 
     /// Check if this amount's commodity has annotations
     pub fn has_annotation(&self) -> bool {
-        self.commodity.as_ref().map_or(false, |c| c.has_annotation())
+        self.commodity.as_ref().is_some_and(|c| c.has_annotation())
     }
 
     /// Return a copy of this amount with annotations stripped per `keep_details`.
@@ -361,7 +361,7 @@ impl Amount {
                     if let Some(price) = annotation.price() {
                         new_annotation = Annotation::with_all(
                             Some(price.clone()),
-                            new_annotation.date().clone(),
+                            *new_annotation.date(),
                             new_annotation.tag().clone(),
                             new_annotation.value_expr().clone(),
                         );
@@ -381,7 +381,7 @@ impl Amount {
                     if let Some(tag) = annotation.tag() {
                         new_annotation = Annotation::with_all(
                             new_annotation.price().clone(),
-                            new_annotation.date().clone(),
+                            *new_annotation.date(),
                             Some(tag.clone()),
                             new_annotation.value_expr().clone(),
                         );

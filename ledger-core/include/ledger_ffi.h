@@ -267,6 +267,11 @@ extern "C" {
 
  MEMORY SAFETY: Only call this on strings returned by ledger_*_copy_* functions.
  DO NOT call this on strings returned by ledger_*_get_* functions (those are borrowed).
+
+ # Safety
+
+ `s` must be a pointer previously returned by a `ledger_*_copy_*` function,
+ or null. The pointer must not have been freed already.
  */
  void ledger_free_string(char *s) ;
 
@@ -461,6 +466,11 @@ enum LedgerResult ledger_journal_process_in_batches(const struct CJournal *journ
 
 /*
  Clone a reference to the journal (increment reference count)
+
+ # Safety
+
+ `journal` must be a valid pointer returned by `ledger_rc_journal_new` or
+ `ledger_rc_journal_clone`, and must not have been freed.
  */
  struct RcJournal *ledger_rc_journal_clone(const struct RcJournal *journal) ;
 
